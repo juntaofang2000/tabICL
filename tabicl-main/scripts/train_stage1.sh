@@ -4,11 +4,11 @@
 # Generate prior datasets on the fly
 # ----------------------------------
 
-torchrun --standalone --nproc_per_node=1 /path/to/tabicl/train/run.py \
+torchrun --standalone --nproc_per_node=4 /home/hzf00006536/fjt/tabicl-main/tabicl-main/src/tabicl/train/run.py \
             --wandb_log True \
             --wandb_project TabICL \
             --wandb_name Stage1 \
-            --wandb_dir /my/wandb/dir \
+            --wandb_dir  ~/wandb  \
             --wandb_mode online \
             --device cuda \
             --dtype float32 \
@@ -25,9 +25,9 @@ torchrun --standalone --nproc_per_node=1 /path/to/tabicl/train/run.py \
             --prior_device cpu \
             --batch_size_per_gp 4 \
             --min_features 2 \
-            --max_features 100 \
+            --max_features 4 \
             --max_classes 10 \
-            --max_seq_len 1024 \
+            --max_seq_len 128 \
             --min_train_size 0.1 \
             --max_train_size 0.9 \
             --embed_dim 128 \
@@ -42,7 +42,7 @@ torchrun --standalone --nproc_per_node=1 /path/to/tabicl/train/run.py \
             --icl_nhead 4 \
             --ff_factor 2 \
             --norm_first True \
-            --checkpoint_dir /my/stage1/checkpoint/dir \
+            --checkpoint_dir ~/checkpoint/dir \
             --save_temp_every 50 \
             --save_perm_every 5000
 
