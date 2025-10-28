@@ -1,0 +1,22 @@
+<component name="InspectionProjectProfileManager">
+  <profile version="1.0">
+    <option name="myName" value="Project Default" />
+    <inspection_tool class="PyPackageRequirementsInspection" enabled="true" level="WARNING" enabled_by_default="true">
+      <option name="ignoredPackages">
+        <list>
+          <option value="annotated-types" />
+          <option value="gluonts" />
+          <option value="matplotlib" />
+          <option value="nvidia-cufile-cu12" />
+          <option value="ply" />
+          <option value="pydantic" />
+          <option value="pydantic_core" />
+          <option value="PyQt5" />
+          <option value="seaborn" />
+          <option value="toolz" />
+          <option value="typing-inspection" />
+        </list>
+      </option>
+    </inspection_tool>
+  </profile>
+</component>
