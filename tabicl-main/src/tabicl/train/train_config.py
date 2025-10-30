@@ -22,6 +22,7 @@ def train_size_type(value):
 
 
 def build_parser():
+    print("Building parser for training...----------------------------------------------")
     """Build parser with all TabICL training arguments."""
     parser = argparse.ArgumentParser()
 
@@ -93,11 +94,18 @@ def build_parser():
     )
 
     # Prior Dataset Config
+
     parser.add_argument(
         "--prior_dir",
         type=str,
         default=None,
         help="If set, load pre-generated prior datasets directly from this directory on disk instead of generating them on the fly.",
+    )
+    parser.add_argument(
+        "--real_data_dir",
+        type=str,
+        default=None,
+        help="If set, load real datasets directly from this directory on disk instead of generating them on the fly.",
     )
     parser.add_argument(
         "--load_prior_start",
@@ -148,7 +156,7 @@ def build_parser():
         help="If True, occasionally sample smaller sequence lengths to ensure model robustness on smaller datasets",
     )
     parser.add_argument(
-        "--prior_type", default="mix_scm", type=str, help="Prior type: dummy, mlp_scm, tree_scm, mix_scm"
+        "--prior_type", default="mix_scm", type=str, help="Prior type: dummy, mlp_scm, tree_scm, mix_scm, real"
     )
     parser.add_argument("--prior_device", default="cpu", type=str, help="Device for prior data generation")
 
@@ -167,7 +175,12 @@ def build_parser():
         type=str2bool,
         help="If True, compile the model using torch.compile for speedup",
     )
-
+    parser.add_argument(
+        "--train_mantis",
+        default=False,
+        type=str2bool,
+        help="If True, train the mantis",
+    )
     # Column Embedding Config
     parser.add_argument("--embed_dim", type=int, default=128, help="Base embedding dimension")
     parser.add_argument("--col_num_blocks", type=int, default=3, help="Number of blocks in column embedder")

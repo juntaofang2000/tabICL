@@ -8,8 +8,10 @@ from .interaction import RowInteraction
 from .learning import ICLearning
 from .inference_config import InferenceConfig
 
+from tabicl.model.mantis_dev.architecture.architecture import Mantis8M
+import torch
 
-class TabICL(nn.Module):
+class MantisICL(nn.Module):
     """A Tabular In-Context Learning Foundation Model.
 
     TabICL is a transformer-based architecture for in-context learning on tabular data to make
@@ -32,26 +34,6 @@ class TabICL(nn.Module):
         Model dimension used in the column / row embedding transformers. For the in-context
         learning transformer, the dimension is this value multiplied by the number of CLS tokens.
 
-    col_num_blocks : int, default=3
-        Number of induced self-attention blocks in the column embedding transformer
-
-    col_nhead : int, default=4
-        Number of attention heads in the column embedding transformer
-
-    col_num_inds : int, default=128
-        Number of inducing points in the column embedding transformer
-
-    row_num_blocks : int, default=3
-        Number of attention blocks in the row interaction transformer
-
-    row_nhead : int, default=8
-        Number of attention heads in the row interaction transformer
-
-    row_num_cls : int, default=4
-        Number of learnable CLS tokens used to aggregate feature information per row
-
-    row_rope_base : float, default=100000
-        Base scaling factor for rotary position encoding in the row interaction transformer
 
     icl_num_blocks : int, default=12
         Number of transformer blocks in the in-context learning transformer
@@ -70,68 +52,79 @@ class TabICL(nn.Module):
 
     norm_first : bool, default=True
         If True, uses pre-norm architecture across all components
+
+    train_mantis : bool, default=False
+        If True, Mantis8M will be trained. If False, pre-trained weights will be loaded.
     """
 
     def __init__(
         self,
-        max_classes: int = 10,
-        embed_dim: int = 128,
-        col_num_blocks: int = 3,
-        col_nhead: int = 4,
-        col_num_inds: int = 128,
-        row_num_blocks: int = 3,
-        row_nhead: int = 8,
-        row_num_cls: int = 4,
-        row_rope_base: float = 100000,
+        max_classes: int = 60,
         icl_num_blocks: int = 12,
         icl_nhead: int = 4,
         ff_factor: int = 2,
         dropout: float = 0.0,
         activation: str | callable = "gelu",
         norm_first: bool = True,
+        icl_dim: int = 256,   #  跟mantis 的 hidden_dim 对应
+        train_mantis: bool =True,
     ):
         super().__init__()
         self.max_classes = max_classes
-        self.embed_dim = embed_dim
-        self.col_num_blocks = col_num_blocks
-        self.col_nhead = col_nhead
-        self.col_num_inds = col_num_inds
-        self.row_num_blocks = row_num_blocks
-        self.row_nhead = row_nhead
-        self.row_num_cls = row_num_cls
-        self.row_rope_base = row_rope_base
         self.icl_num_blocks = icl_num_blocks
         self.icl_nhead = icl_nhead
         self.ff_factor = ff_factor
         self.dropout = dropout
         self.activation = activation
         self.norm_first = norm_first
+        self.icl_dim = icl_dim
+        self.train_mantis = train_mantis
+        print(f"train_mantis set to {self.train_mantis}")
 
-        self.col_embedder = ColEmbedding(
-            embed_dim=embed_dim,
-            num_blocks=col_num_blocks,
-            nhead=col_nhead,
-            num_inds=col_num_inds,
-            dim_feedforward=embed_dim * ff_factor,
-            dropout=dropout,
-            activation=activation,
-            norm_first=norm_first,
-            reserve_cls_tokens=row_num_cls,
+        # Initialize Mantis8M
+
+        self.mantis_model = Mantis8M(
+            seq_len=512,
+            hidden_dim=256,
+            num_patches=32,
+            scalar_scales=None,
+            hidden_dim_scalar_enc=32,
+            epsilon_scalar_enc=1.1,
+            transf_depth=6,
+            transf_num_heads=8,
+            transf_mlp_dim=512,
+            transf_dim_head=128,
+            transf_dropout=0.1,
+            device="cuda" if torch.cuda.is_available() else "cpu",
+            pre_training=False  # forward 的时候没有 prj 头
         )
 
-        self.row_interactor = RowInteraction(
-            embed_dim=embed_dim,
-            num_blocks=row_num_blocks,
-            nhead=row_nhead,
-            num_cls=row_num_cls,
-            rope_base=row_rope_base,
-            dim_feedforward=embed_dim * ff_factor,
-            dropout=dropout,
-            activation=activation,
-            norm_first=norm_first,
-        )
+        # 无论 train_mantis True/False，都加载预训练权重
+        pretrained_path = "/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint"
+        self.mantis_model = self.mantis_model.from_pretrained(pretrained_path)
 
-        icl_dim = embed_dim * row_num_cls  # CLS tokens are concatenated for ICL
+        if not self.train_mantis:
+            for param in self.mantis_model.parameters():
+                param.requires_grad_(False)
+            print("Mantis8M fully frozen ")
+
+        # 否则，只冻结 projection 层
+        else:
+            if hasattr(self.mantis_model, "prj"):
+                for name, param in self.mantis_model.prj.named_parameters():
+                    param.requires_grad_(False)
+                print("Only Frozen Mantis projection layer (mantis.prj) ")
+
+        # Load pre-trained weights if not training
+        # if not self.train_mantis:
+        #     # MODEL_PATH = "/data0/fangjuntao2025/CauKer/CauKer-main/Models/Mantis/checkpoint/Graph100-k6P520250915"
+        #     # model_params = torch.load(MODEL_PATH, weights_only=True)
+        #     # self.mantis_model.load_state_dict(model_params)
+        #     self.mantis_model = self.mantis_model.from_pretrained("/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint")
+        #     # for param in self.mantis_model.parameters():
+        #     #     param.requires_grad_(False)  # 冻结参数
+        #     print("Loaded pre-trained Mantis8M weights and unfroze the model parameters------------------------------------.")
+
         self.icl_predictor = ICLearning(
             max_classes=max_classes,
             d_model=icl_dim,
@@ -154,7 +147,7 @@ class TabICL(nn.Module):
             Input tensor of shape (B, T, H) where:
              - B is the number of tables      数据集数量    
              - T is the number of samples (rows)  一条时序
-             - H is the number of features (columns)  时序长度： 512 
+             - H is the number of features (columns)  时序长度(embeding 特征数)： 512 
             The first train_size positions contain training samples, and the remaining positions contain test samples.
 
         y_train : Tensor
@@ -179,13 +172,31 @@ class TabICL(nn.Module):
         if d is not None and len(d.unique()) == 1 and d[0] == H:
             d = None
 
-        # Column-wise embedding -> Row-wise interaction
-        representations = self.row_interactor(
-            self.col_embedder(X, d=d, train_size=None if embed_with_test else train_size), d=d
-        )
+        # Split X into T sub-tensors of shape [B, 1, H]
+        # X_split = torch.split(X, 1, dim=1)  # List of [B, 1, H] tensors
+
+        # # Process each sub-tensor through Mantis8M and collect representations
+        # representations = []
+        # for x in X_split:
+        #     # x shape: [B, 1, H]
+        #     rep = self.mantis_model(x)  # rep shape: [1, D]
+        #     rep = rep.unsqueeze(1)     # Reshape to [B, 1, D]
+        #     representations.append(rep)
+
+        # # Concatenate all representations along the sequence dimension
+        # representations = torch.cat(representations, dim=1)  # shape: [B, T, D]
+        X_reshaped = X.reshape(-1, 1, H)  # shape: [B*T, 1, H]
+        representations = self.mantis_model(X_reshaped)  # rep shape: [B*T, D]
+        representations = representations.reshape(B, T, -1)  # Reshape back to [B, T, D]
 
         # Dataset-wise in-context learning
         out = self.icl_predictor(representations, y_train=y_train)
+        # for name, param in self.named_parameters():
+        #     if not param.requires_grad:
+        #         print(f"Parameter {name} is frozen and unused.")
+                
+        # print(f"Mantis8M parameters used: {self.mantis_model.training}")
+        # print(f"ICLearning parameters used: {self.icl_predictor.training}")
 
         return out
 
@@ -245,17 +256,41 @@ class TabICL(nn.Module):
         if inference_config is None:
             inference_config = InferenceConfig()
 
-        # Column-wise embedding -> Row-wise interaction
-        representations = self.row_interactor(
-            self.col_embedder(
-                X,
-                train_size=None if embed_with_test else train_size,
-                feature_shuffles=feature_shuffles,
-                mgr_config=inference_config.COL_CONFIG,
-            ),
-            mgr_config=inference_config.ROW_CONFIG,
-        )
+        # # Split X into T sub-tensors of shape [B, 1, H]
+        # X_split = torch.split(X, 1, dim=1)  # List of [B, 1, H] tensors  # 
 
+        # self.mantis_model.pre_training  =  False
+        # # Process each sub-tensor through Mantis8M and collect representations
+        # representations = []
+        # for x in X_split:
+        #     # x shape: [B, 1, H]
+        #     rep = self.mantis_model(x)  
+        #     rep = rep.unsqueeze(1)  # rep shape: [B, 1, D] 
+        #     representations.append(rep)
+
+        # # Concatenate all representations along the sequence dimension
+        # representations = torch.cat(representations, dim=1)  # shape: [B, T, D]
+        # Reshape X to [B*T, 1, H] and process all at once
+        B, T, H = X.shape
+        X_reshaped = X.reshape(-1, 1, H)  # shape: [B*T, 1, H]
+        self.mantis_model.pre_training = False
+        # representations = self.mantis_model(X_reshaped)  # rep shape: [B*T, D]
+        # representations = representations.view(B, T, -1)  # Reshape back to [B, T, D]
+        
+        
+        # 修改后
+        batch_size = 32  # 可根据GPU内存调整
+        BT = X_reshaped.shape[0]
+        representations_list = []
+
+        for i in range(0, BT, batch_size):
+            end_idx = min(i + batch_size, BT)
+            batch_X = X_reshaped[i:end_idx]  # [batch_size, 1, H]
+            batch_rep = self.mantis_model(batch_X)  # [batch_size, D]
+            representations_list.append(batch_rep)
+
+        representations = torch.cat(representations_list, dim=0)  # [B*T, D]
+        representations = representations.reshape(B, T, -1)          
         # Dataset-wise in-context learning
         out = self.icl_predictor(
             representations,

@@ -208,8 +208,8 @@ class ICLearning(nn.Module):
         ----------
         R : Tensor
             Row representations of shape (B, T, D) where:
-             - B is the number of tables
-             - T is the number of samples (rows)
+             - B is the number of tables    数据集
+             - T is the number of samples (rows)  时序数量 
              - D is the dimension of row representations
 
         y_train : Tensor of shape (B, train_size)
@@ -218,6 +218,9 @@ class ICLearning(nn.Module):
         """
 
         train_size = y_train.shape[1]
+        # print("DEBUG shapes: R", R.shape, "y_train", y_train.shape)
+        # y_enc = self.y_encoder(y_train.float())
+        # print("DEBUG y_enc", y_enc.shape)
         R[:, :train_size] = R[:, :train_size] + self.y_encoder(y_train.float())
         src = self.tf_icl(R, attn_mask=train_size)
         if self.norm_first:

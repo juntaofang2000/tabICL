@@ -19,7 +19,7 @@ import os
 import sys
 import math
 import warnings
-from typing import Dict, Tuple, Union, Optional, Any
+from typing import Dict, Tuple, Union, Optional, Any, List
 
 import numpy as np
 from scipy.stats import loguniform
@@ -30,13 +30,15 @@ import torch.nn.functional as F
 from torch import Tensor
 from torch.nested import nested_tensor
 from torch.utils.data import IterableDataset
-
+from torch.utils.data import Dataset
 from .mlp_scm import MLPSCM
 from .tree_scm import TreeSCM
 
 from .hp_sampling import HpSamplerList
 from .reg2cls import Reg2Cls
 from .prior_config import DEFAULT_FIXED_HP, DEFAULT_SAMPLED_HP
+from .data_reader import DataReader
+import random  # 添加 random 模块的导入
 
 
 warnings.filterwarnings(
@@ -840,12 +842,548 @@ class DummyPrior(Prior):
         return X, y, d, seq_lens, train_sizes
 
 
+
+
+# create by fang juntao :  load UCR datasets to generate batch datasets
+class RealPrior(Prior):
+    """
+    This class loads and processes real time series datasets for in-context learning.
+
+    Parameters
+    ----------
+    data_path : str
+        Path to the directory containing the UCR datasets
+
+    batch_size : int, default=256
+        Number of datasets to generate
+
+    min_features : int, default=2
+        Minimum number of features per dataset
+
+    max_features : int, default=100
+        Maximum number of features per dataset
+
+    max_classes : int, default=10
+        Maximum number of target classes
+
+    min_seq_len : int, default=None
+        Minimum samples per dataset. If None, uses max_seq_len directly.
+
+    max_seq_len : int, default=1024
+        Maximum samples per dataset
+
+    log_seq_len : bool, default=False
+        If True, sample sequence length from a log-uniform distribution
+
+    min_train_size : int|float, default=0.1
+        Position or ratio for train/test split start. If int, absolute position.
+        If float between 0 and 1, specifies a fraction of sequence length.
+
+    max_train_size : int|float, default=0.9
+        Position or ratio for train/test split end. If int, absolute position.
+        If float between 0 and 1, specifies a fraction of sequence length.
+
+    device : str, default="cpu"
+        Computation device
+    """
+
+    def __init__(
+        self,
+        data_path: str,
+        batch_size: int = 256,
+        min_features: int = 2,
+        max_features: int = 100,
+        max_classes: int = 10,
+        min_seq_len: Optional[int] = None,
+        max_seq_len: int = 1024,
+        log_seq_len: bool = False,
+        min_train_size: Union[int, float] = 0.1,
+        max_train_size: Union[int, float] = 0.9,
+        device: str = "cpu",
+    ):
+        super().__init__(
+            batch_size=batch_size,
+            min_features=min_features,
+            max_features=max_features,
+            max_classes=max_classes,
+            min_seq_len=min_seq_len,
+            max_seq_len=max_seq_len,
+            log_seq_len=log_seq_len,
+            min_train_size=min_train_size,
+            max_train_size=max_train_size,
+        )
+        self.data_path = data_path
+        self.device = device
+        self.reader = DataReader(data_path=data_path)
+        self.datasets = self._load_datasets()
+
+    def _load_datasets(self) -> List[Tuple[Tensor, Tensor]]:
+        """
+        Load all UCR training datasets.
+
+        Returns
+        -------
+        List[Tuple[Tensor, Tensor]]
+            List of (X, y) tuples for each dataset
+        """
+        datasets = []
+        for dataset_name in self.reader.dataset_list_ucr:
+            try:
+                # Load only training data
+                X_train, y_train = self.reader.read_dataset(dataset_name, which_set='train')
+
+                # Ensure data shape is (n_samples, seq_len)
+                if len(X_train.shape) == 3:
+                    X_train = X_train.squeeze(1)  # Remove channel dimension if present
+
+                X = torch.from_numpy(X_train).float().to(self.device)
+                y = torch.from_numpy(y_train).long().to(self.device)
+                datasets.append((X, y))
+            except Exception as e:
+                print(f"Failed to load dataset {dataset_name}: {e}")
+                continue
+        return datasets
+
+
+
+
+
+    # def _load_datasets(self) -> List[Tuple[Tuple[Tensor, Tensor], Tuple[Tensor, Tensor]]]:
+    #     """
+    #     加载所有 UCR 数据集，并固定划分训练集和测试集。
+
+    #     Returns
+    #     -------
+    #     List[Tuple[Tuple[Tensor, Tensor], Tuple[Tensor, Tensor]]]
+    #         每个数据集的 (训练集, 测试集) 元组列表。
+    #     """
+    #     datasets = []
+    #     for dataset_name in self.reader.dataset_list_ucr:
+    #         try:
+    #             # 加载完整数据集
+    #             X, y = self.reader.read_dataset(dataset_name, which_set='all')
+
+    #             # 确保数据形状为 (n_samples, seq_len)
+    #             if len(X.shape) == 3:
+    #                 X = X.squeeze(1)
+
+    #             # 随机划分训练集和测试集
+    #             n_samples = X.shape[0]
+    #             test_size = int(n_samples * self.test_ratio)
+    #             indices = torch.randperm(n_samples)
+    #             test_indices = indices[:test_size]
+    #             train_indices = indices[test_size:]
+
+    #             X_train, y_train = X[train_indices], y[train_indices]
+    #             X_test, y_test = X[test_indices], y[test_indices]
+
+    #             # 转换为 Tensor
+    #             X_train = torch.from_numpy(X_train).float().to(self.device)
+    #             y_train = torch.from_numpy(y_train).long().to(self.device)
+    #             X_test = torch.from_numpy(X_test).float().to(self.device)
+    #             y_test = torch.from_numpy(y_test).long().to(self.device)
+
+    #             datasets.append(((X_train, y_train), (X_test, y_test)))
+    #         except Exception as e:
+    #             print(f"Failed to load dataset {dataset_name}: {e}")
+    #             continue
+    #     return datasets
+
+
+    @torch.no_grad()
+    def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """
+        Generates a batch of real datasets.
+
+        Parameters
+        ----------
+        batch_size : int, optional
+            Batch size override, if None, uses self.batch_size
+
+        Returns
+        -------
+        X : Tensor
+            Features tensor of shape (batch_size, seq_len, max_features).
+            Contains real feature values.
+
+        y : Tensor
+            Labels tensor of shape (batch_size, seq_len).
+            Contains real class labels.
+
+        d : Tensor
+            Number of features per dataset of shape (batch_size,).
+            Always set to actual number of features in each dataset.
+
+        seq_lens : Tensor
+            Sequence length for each dataset of shape (batch_size,).
+            All datasets share the same sequence length.
+
+        train_sizes : Tensor
+            Position for train/test split for each dataset of shape (batch_size,).
+            All datasets share the same split position.
+        """
+        batch_size = batch_size or self.batch_size
+        batch_X = []
+        batch_y = []
+        batch_d = []
+        batch_seq_lens = []
+        batch_train_sizes = []
+
+        for _ in range(batch_size):
+            # Randomly select a dataset
+            X, y = random.choice(self.datasets)
+            
+            # Sample sequence length  时间序列的条数
+            seq_len = min(self.sample_seq_len(self.min_seq_len, self.max_seq_len, log=self.log_seq_len), X.shape[0])
+            
+            # Randomly select a window of the sequence
+            start_idx = torch.randint(0, X.shape[0] - seq_len + 1, (1,)).item()
+            X_window = X[start_idx:start_idx + seq_len]
+            y_window = y[start_idx:start_idx + seq_len]
+            
+            # Sample train size
+            train_size = self.sample_train_size(self.min_train_size, self.max_train_size, seq_len)
+            
+            # Pad features if necessary
+            # if X_window.shape[1] < self.max_features:
+            #     padding = torch.zeros(seq_len, self.max_features - X_window.shape[1], device=self.device)
+            #     X_window = torch.cat([X_window, padding], dim=1)
+            
+            batch_X.append(X_window)
+            batch_y.append(y_window)
+            batch_d.append(X_window.shape[1])
+            batch_seq_lens.append(seq_len)
+            batch_train_sizes.append(train_size)
+            
+        X = nested_tensor([x.to(self.device) for x in batch_X], device=self.device)
+        y = nested_tensor([y.to(self.device) for y in batch_y], device=self.device)
+        d = torch.tensor(batch_d, device=self.device)
+        seq_lens = torch.tensor(batch_seq_lens, device=self.device)
+        train_sizes = torch.tensor(batch_train_sizes, device=self.device)
+
+        return X, y, d, seq_lens, train_sizes 
+
+    """         # X = torch.stack(batch_X)
+            X = nested_tensor([x.to(self.device) for x in batch_X], device=self.device)
+            y = nested_tensor([y.to(self.device) for y in batch_y], device=self.device)
+            d = torch.tensor(batch_d, device=self.device)
+            seq_lens = torch.tensor(batch_seq_lens, device=self.device)
+            train_sizes = torch.tensor(batch_train_sizes, device=self.device)
+
+            return X, y, d, seq_lens, train_sizes
+
+            batch_size = batch_size or self.batch_size
+            batch_X = []
+            batch_y = []
+            batch_d = []
+            batch_seq_lens = []
+            batch_train_sizes = []
+
+            # 首先确定统一的序列长度
+            unified_seq_len = self.sample_seq_len(self.min_seq_len, self.max_seq_len, log=self.log_seq_len)
+            
+            for _ in range(batch_size):
+                # 随机选择一个数据集
+                X, y = random.choice(self.datasets)
+                
+                # 确保数据集长度足够
+                if X.shape[0] < unified_seq_len:
+                    continue
+                    
+                # 随机选择一个起始位置
+                start_idx = torch.randint(0, X.shape[0] - unified_seq_len + 1, (1,)).item()
+                X_window = X[start_idx:start_idx + unified_seq_len]
+                y_window = y[start_idx:start_idx + unified_seq_len]
+                
+                # 采样训练集大小
+                train_size = self.sample_train_size(self.min_train_size, self.max_train_size, unified_seq_len)
+                
+                batch_X.append(X_window)
+                batch_y.append(y_window)
+                batch_d.append(X_window.shape[1])
+                batch_seq_lens.append(unified_seq_len)
+                batch_train_sizes.append(train_size)
+
+            # 确保批次大小足够
+            while len(batch_X) < batch_size:
+                # 如果不够，重复使用已有的数据   可能有问题
+                idx = random.randint(0, len(batch_X)-1)
+                batch_X.append(batch_X[idx])
+                batch_y.append(batch_y[idx])
+                batch_d.append(batch_d[idx])
+                batch_seq_lens.append(batch_seq_lens[idx])
+                batch_train_sizes.append(batch_train_sizes[idx])
+
+            X = nested_tensor([x.to(self.device) for x in batch_X], device=self.device)
+            y = nested_tensor([y.to(self.device) for y in batch_y], device=self.device)
+            d = torch.tensor(batch_d, device=self.device)
+            seq_lens = torch.tensor(batch_seq_lens, device=self.device)
+            train_sizes = torch.tensor(batch_train_sizes, device=self.device)
+
+            return X, y, d, seq_lens, train_sizes """
+
+    # @torch.no_grad()
+    # def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+    #     batch_size = batch_size or self.batch_size
+    #     batch_X = []
+    #     batch_y = []
+    #     batch_d = []
+    #     batch_seq_lens = []
+    #     batch_train_sizes = []
+
+    #     for _ in range(batch_size):
+    #         # Randomly select a dataset
+    #         (X_train, y_train), (X_test, y_test) = random.choice(self.datasets)
+            
+    #         # Decide whether to sample from train or test
+    #         use_train = random.random() < 0.8  # 80% chance to use training data
+            
+    #         if use_train:
+    #             X, y = X_train, y_train
+    #         else:
+    #             X, y = X_test, y_test
+            
+    #         # Sample sequence length
+    #         seq_len = min(self.sample_seq_len(self.min_seq_len, self.max_seq_len, log=self.log_seq_len), X.shape[0])
+            
+    #         # Randomly select a window of the sequence
+    #         start_idx = torch.randint(0, X.shape[0] - seq_len + 1, (1,)).item()
+    #         X_window = X[start_idx:start_idx + seq_len]
+    #         y_window = y[start_idx:start_idx + seq_len]
+            
+    #         # Sample train size (only for the selected portion)
+    #         train_size = self.sample_train_size(self.min_train_size, self.max_train_size, seq_len)
+            
+    #         batch_X.append(X_window)
+    #         batch_y.append(y_window)
+    #         batch_d.append(X_window.shape[1])
+    #         batch_seq_lens.append(seq_len)
+    #         batch_train_sizes.append(train_size)
+            
+    #     X = nested_tensor([x.to(self.device) for x in batch_X], device=self.device)
+    #     y = nested_tensor([y.to(self.device) for y in batch_y], device=self.device)
+    #     d = torch.tensor(batch_d, device=self.device)
+    #     seq_lens = torch.tensor(batch_seq_lens, device=self.device)
+    #     train_sizes = torch.tensor(batch_train_sizes, device=self.device)
+
+    #     return X, y, d, seq_lens, train_sizes
+
+
+
+
+
+
+# create by fang juntao :  load UCR datasets to generate batch datasets, 避免前后batch 存在数据泄露
+class RealPriorTrain(Prior):
+    """
+    This class loads and processes real time series datasets for in-context learning.
+
+    Parameters
+    ----------
+    data_path : str
+        Path to the directory containing the UCR datasets
+
+    batch_size : int, default=256
+        Number of datasets to generate
+
+    min_features : int, default=2
+        Minimum number of features per dataset
+
+    max_features : int, default=100
+        Maximum number of features per dataset
+
+    max_classes : int, default=10
+        Maximum number of target classes
+
+    min_seq_len : int, default=None
+        Minimum samples per dataset. If None, uses max_seq_len directly.
+
+    max_seq_len : int, default=1024
+        Maximum samples per dataset
+
+    log_seq_len : bool, default=False
+        If True, sample sequence length from a log-uniform distribution
+
+    min_train_size : int|float, default=0.1
+        Position or ratio for train/test split start. If int, absolute position.
+        If float between 0 and 1, specifies a fraction of sequence length.
+
+    max_train_size : int|float, default=0.9
+        Position or ratio for train/test split end. If int, absolute position.
+        If float between 0 and 1, specifies a fraction of sequence length.
+
+    device : str, default="cpu"
+        Computation device
+    """
+
+    def __init__(
+        self,
+        data_path: str,
+        batch_size: int = 256,
+        min_features: int = 2,
+        max_features: int = 100,
+        max_classes: int = 10,
+        min_seq_len: Optional[int] = None,
+        max_seq_len: int = 1024,
+        log_seq_len: bool = False,
+        min_train_size: Union[int, float] = 0.1,
+        max_train_size: Union[int, float] = 0.9,
+        device: str = "cpu",
+    ):
+        super().__init__(
+            batch_size=batch_size,
+            min_features=min_features,
+            max_features=max_features,
+            max_classes=max_classes,
+            min_seq_len=min_seq_len,
+            max_seq_len=max_seq_len,
+            log_seq_len=log_seq_len,
+            min_train_size=min_train_size,
+            max_train_size=max_train_size,
+        )
+        self.data_path = data_path
+        self.device = device
+        self.reader = DataReader(data_path=data_path)
+        self.datasets = self._load_datasets()
+
+
+    def _load_datasets(self) -> List[Tuple[Tensor, Tensor, Tensor, Tensor]]:
+        """
+        Load all UCR training datasets and split them into train/test portions.
+
+        Returns
+        -------
+        List[Tuple[Tensor, Tensor, Tensor, Tensor]]
+            List of (X_train, y_train, X_test, y_test) tuples for each dataset
+        """
+        datasets = []
+        for dataset_name in self.reader.dataset_list_ucr:
+            try:
+                # Load training data
+                X_train_full, y_train_full = self.reader.read_dataset(dataset_name, which_set='train')
+
+                # Ensure data shape is (n_samples, seq_len)
+                if len(X_train_full.shape) == 3:
+                    X_train_full = X_train_full.squeeze(1)
+
+                # Convert to tensors
+                X_train_full = torch.from_numpy(X_train_full).float().to(self.device)
+                y_train_full = torch.from_numpy(y_train_full).long().to(self.device)
+
+                # Fixed train/test split (80/20)
+                n_samples = X_train_full.shape[0]
+                train_size = int(0.8 * n_samples)
+                
+                # Generate fixed random indices
+                torch.manual_seed(42)  # Fixed seed for reproducibility
+                indices = torch.randperm(n_samples)
+                train_indices = indices[:train_size]
+                test_indices = indices[train_size:]
+
+                # Split the data
+                X_train = X_train_full[train_indices]
+                y_train = y_train_full[train_indices]
+                X_test = X_train_full[test_indices]
+                y_test = y_train_full[test_indices]
+
+                datasets.append((X_train, y_train, X_test, y_test))
+            except Exception as e:
+                print(f"Failed to load dataset {dataset_name}: {e}")
+                continue
+        return datasets
+
+    @torch.no_grad()
+    def get_batch(self, batch_size: Optional[int] = None) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        """
+        Generates a batch of real datasets with fixed train/test separation.
+
+        Parameters
+        ----------
+        batch_size : int, optional
+            Batch size override, if None, uses self.batch_size
+
+        Returns
+        -------
+        X : Tensor
+            Features tensor of shape (batch_size, seq_len, max_features).
+            Contains real feature values.
+
+        y : Tensor
+            Labels tensor of shape (batch_size, seq_len).
+            Contains real class labels.
+
+        d : Tensor
+            Number of features per dataset of shape (batch_size,).
+            Always set to actual number of features in each dataset.
+
+        seq_lens : Tensor
+            Sequence length for each dataset of shape (batch_size,).
+            All datasets share the same sequence length.
+
+        train_sizes : Tensor
+            Position for train/test split for each dataset of shape (batch_size,).
+            All datasets share the same split position.
+        """
+        batch_size = batch_size or self.batch_size
+        batch_X = []
+        batch_y = []
+        batch_d = []
+        batch_seq_lens = []
+        batch_train_sizes = []
+
+        for _ in range(batch_size):
+            # Randomly select a dataset
+            X_train, y_train, X_test, y_test = random.choice(self.datasets)
+            
+            # Sample sequence length
+            seq_len = min(self.sample_seq_len(self.min_seq_len, self.max_seq_len, log=self.log_seq_len), 
+                        min(X_train.shape[0], X_test.shape[0]))
+            
+            # Randomly select windows from train and test
+            train_start = torch.randint(0, X_train.shape[0] - seq_len + 1, (1,)).item()
+            test_start = torch.randint(0, X_test.shape[0] - seq_len + 1, (1,)).item()
+            
+            X_train_window = X_train[train_start:train_start + seq_len]
+            y_train_window = y_train[train_start:train_start + seq_len]
+            X_test_window = X_test[test_start:test_start + seq_len]
+            y_test_window = y_test[test_start:test_start + seq_len]
+            
+            # Concatenate train and test windows
+            X_window = torch.cat([X_train_window, X_test_window], dim=0)
+            y_window = torch.cat([y_train_window, y_test_window], dim=0)
+            
+            # Sample train size (only for the train portion)
+            train_size = self.sample_train_size(self.min_train_size, self.max_train_size, seq_len)
+            
+            batch_X.append(X_window)
+            batch_y.append(y_window)
+            batch_d.append(X_window.shape[1])
+            batch_seq_lens.append(seq_len * 2)  # Total sequence length
+            batch_train_sizes.append(train_size)
+            
+        X = nested_tensor([x.to(self.device) for x in batch_X], device=self.device)
+        y = nested_tensor([y.to(self.device) for y in batch_y], device=self.device)
+        d = torch.tensor(batch_d, device=self.device)
+        seq_lens = torch.tensor(batch_seq_lens, device=self.device)
+        train_sizes = torch.tensor(batch_train_sizes, device=self.device)
+
+        return X, y, d, seq_lens, train_sizes
+
+
+
+
+
+
+
 class PriorDataset(IterableDataset):
     """
     Main dataset class that provides an infinite iterator over synthetic tabular datasets.
 
     Parameters
     ----------
+    real_data_dir: str, default=None
+        Path to real data directory. If provided, uses RealPrior to load datasets.
+    
     batch_size : int, default=256
         Total number of datasets to generate per batch
 
@@ -917,6 +1455,7 @@ class PriorDataset(IterableDataset):
 
     def __init__(
         self,
+        real_data_dir: Optional[str] = None,
         batch_size: int = 256,
         batch_size_per_gp: int = 4,
         batch_size_per_subgp: Optional[int] = None,
@@ -947,6 +1486,20 @@ class PriorDataset(IterableDataset):
                 min_seq_len=min_seq_len,
                 max_seq_len=max_seq_len,
                 log_seq_len=log_seq_len,
+                min_train_size=min_train_size,
+                max_train_size=max_train_size,
+                device=device,
+            )
+        elif prior_type == "real":
+            self.prior = RealPrior(
+                data_path= real_data_dir, 
+                batch_size=batch_size,
+                min_features=min_features,  # 用不上
+                max_features=max_features,  # 用不上
+                max_classes=max_classes,  # 用不上
+                min_seq_len=min_seq_len,  # 用不上
+                max_seq_len=max_seq_len,    # 用不上
+                log_seq_len=log_seq_len, # 用不上
                 min_train_size=min_train_size,
                 max_train_size=max_train_size,
                 device=device,
@@ -1074,6 +1627,13 @@ class PriorDataset(IterableDataset):
             f"  device: {self.device}\n"
             f")"
         )
+
+
+
+
+
+
+
 
 
 class DisablePrinting:

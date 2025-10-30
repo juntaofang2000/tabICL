@@ -27,6 +27,14 @@ from tabicl.prior.genload import LoadPriorDataset
 from tabicl.train.optim import get_scheduler
 from tabicl.train.train_config import build_parser
 
+# 1. Import from custom modules
+from tabicl.prior.data_reader import DataReader                 # Your DataReader  本地源代码
+from tabicl.model.mantis_dev.architecture import Mantis8M       # mantis_dev 本地源代码
+from tabicl.model.mantis_dev.trainer import MantisTrainer       # MantisTrainer class 本地源代码
+from tabicl.model.mantisICL import MantisICL
+
+import sys
+sys.path.append("/data0/fangjuntao2025/tabicl-main/src/tabicl/model")
 
 
 warnings.filterwarnings(
@@ -172,23 +180,17 @@ class Trainer:
 
         self.model_config = {
             "max_classes": self.config.max_classes,
-            "embed_dim": self.config.embed_dim,
-            "col_num_blocks": self.config.col_num_blocks,
-            "col_nhead": self.config.col_nhead,
-            "col_num_inds": self.config.col_num_inds,
-            "row_num_blocks": self.config.row_num_blocks,
-            "row_nhead": self.config.row_nhead,
-            "row_num_cls": self.config.row_num_cls,
-            "row_rope_base": self.config.row_rope_base,
             "icl_num_blocks": self.config.icl_num_blocks,
             "icl_nhead": self.config.icl_nhead,
             "ff_factor": self.config.ff_factor,
             "dropout": self.config.dropout,
             "activation": self.config.activation,
             "norm_first": self.config.norm_first,
+            "train_mantis":self.config.train_mantis
         }
 
-        model = TabICL(**self.model_config)
+
+        model = MantisICL(**self.model_config)
         model.to(device=self.config.device)
 
         if self.master_process:
@@ -590,6 +592,7 @@ class Trainer:
         scaled_loss = loss / num_micro_batches
         self.scaler.scale(scaled_loss).backward()
 
+
         with torch.no_grad():
             micro_results = {}
             micro_results["ce"] = scaled_loss.item()
@@ -670,65 +673,6 @@ class Trainer:
 
         return results
 
-    def test_micro_batch_equivalence(self):  # Juntao Fang: 测试梯度累积
-        """
-        Test whether micro-batch gradient accumulation is equivalent
-        to using a single large batch directly.
-        """
-        print("\n=== Sanity check: Micro-batch vs Large-batch equivalence ===")
-
-        torch.manual_seed(42)
-        B = self.config.micro_batch_size * 4  # e.g. accumulate 4 times
-        seq_len, num_features, num_classes = 8, 16, self.config.max_classes
-
-        # Synthetic batch
-        X = torch.randn(B, seq_len, num_features, device=self.config.device)
-        y = torch.randint(0, num_classes, (B, seq_len), device=self.config.device)
-        d = torch.full((B,), num_features, device=self.config.device)
-
-        # ======== 模式 A: 大 batch 一次性训练 ========
-        modelA = TabICL(**self.model_config).to(self.config.device)
-        modelA.load_state_dict(self.raw_model.state_dict())  # same init
-        modelA.train()
-
-        with self.amp_ctx:
-            pred = modelA(X, y[:, :seq_len//2], d)
-            lossA = F.cross_entropy(pred.flatten(end_dim=-2), y[:, seq_len//2:].long().flatten())
-
-        lossA.backward()
-        gradsA = [p.grad.clone() for p in modelA.parameters() if p.grad is not None]
-
-        # ======== 模式 B: micro-batch 累积 ========
-        modelB = TabICL(**self.model_config).to(self.config.device)
-        modelB.load_state_dict(self.raw_model.state_dict())  # same init
-        modelB.train()
-
-        num_micro_batches = 4
-        for i in range(num_micro_batches):
-            start = i * self.config.micro_batch_size
-            end = (i + 1) * self.config.micro_batch_size
-            micro_X = X[start:end]
-            micro_y = y[start:end]
-            micro_d = d[start:end]
-
-            with self.amp_ctx:
-                pred = modelB(micro_X, micro_y[:, :seq_len//2], micro_d)
-                loss = F.cross_entropy(pred.flatten(end_dim=-2), micro_y[:, seq_len//2:].long().flatten())
-                (loss / num_micro_batches).backward()  # <-- 关键缩放
-
-        gradsB = [p.grad.clone() for p in modelB.parameters() if p.grad is not None]
-
-        # ======== 对比梯度差异 ========
-        all_close = True
-        for i, (ga, gb) in enumerate(zip(gradsA, gradsB)):
-            if not torch.allclose(ga, gb, atol=1e-6):
-                print(f"❌ Layer {i}: gradients differ, max diff = {(ga - gb).abs().max().item():.3e}")
-                all_close = False
-        if all_close:
-            print("✅ Gradients are identical between micro-batch and large-batch!")
-
-        print(f"Loss (large batch): {lossA.item():.6f}")
-        print("=== End of test ===\n")
 
 if __name__ == "__main__":
     print("Starting TabICL training...")
@@ -736,11 +680,10 @@ if __name__ == "__main__":
     config = parser.parse_args()
     try:
         # Set the start method for subprocesses to 'spawn'
-        set_start_method("spawn")       
+        set_start_method("spawn")
     except RuntimeError:
         pass  # Ignore the error if the context has already been set
 
     # Create trainer and start training
     trainer = Trainer(config)
-    #trainer.test_micro_batch_equivalence() 
     trainer.train()
