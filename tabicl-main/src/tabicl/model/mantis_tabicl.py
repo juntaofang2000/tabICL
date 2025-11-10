@@ -1,0 +1,211 @@
+from __future__ import annotations
+
+import warnings
+from pathlib import Path
+from typing import Optional, List
+
+import torch
+from torch import nn, Tensor
+import numpy as np
+
+from .tabicl import TabICL
+from .inference_config import InferenceConfig
+from tabicl.model.mantis_dev.architecture.architecture import Mantis8M
+from tabicl.model.mantis_dev.trainer.trainer import MantisTrainer
+
+def _load_generic_state_dict(model: nn.Module, checkpoint: dict, strict: bool = True) -> None:
+    """Load a checkpoint that may store the state dict under different keys."""
+    state_dict_keys: List[str] = [
+        "state_dict",
+        "model_state_dict",
+        "model",
+        "network",
+        "checkpoint",
+    ]
+
+    state_dict = None
+    for key in state_dict_keys:
+        if key in checkpoint and isinstance(checkpoint[key], dict):
+            state_dict = checkpoint[key]
+            break
+
+    if state_dict is None:
+        if all(isinstance(k, str) for k in checkpoint.keys()):
+            state_dict = checkpoint
+        else:
+            raise ValueError("Unable to locate state dict within the provided checkpoint")
+
+    cleaned_state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+    missing_keys, unexpected_keys = model.load_state_dict(cleaned_state_dict, strict=strict)
+
+    if missing_keys:
+        warnings.warn(f"Missing keys when loading state dict: {missing_keys}")
+    if unexpected_keys:
+        warnings.warn(f"Unexpected keys when loading state dict: {unexpected_keys}")
+
+
+def build_mantis_encoder(
+    mantis_checkpoint: str | Path,
+    device: torch.device,
+    hidden_dim: int = 256,
+    seq_len: int = 512,
+) -> Mantis8M:
+    """Instantiate Mantis8M and load weights from the given checkpoint."""
+
+    mantis_model = Mantis8M(
+        seq_len=seq_len,
+        hidden_dim=hidden_dim,
+        num_patches=32,
+        scalar_scales=None,
+        hidden_dim_scalar_enc=32,
+        epsilon_scalar_enc=1.1,
+        transf_depth=6,
+        transf_num_heads=8,
+        transf_mlp_dim=512,
+        transf_dim_head=128,
+        transf_dropout=0.1,
+        device=str(device),
+        pre_training=False,
+    )
+
+    # checkpoint = torch.load(mantis_checkpoint, map_location="cpu")
+    # _load_generic_state_dict(mantis_model, checkpoint, strict=False)
+    
+    # checkpoint = torch.load(mantis_checkpoint, map_location="cpu")
+    # state_dict = checkpoint.get("net_param", checkpoint)
+    # mantis_model.load_state_dict(state_dict, strict=True)
+    
+    mantis_model  =  mantis_model.from_pretrained("/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint/")
+    print("mantis_model.from_pretrained(/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint/)")
+    mantis_model.to(device)
+    mantis_model.eval()
+
+    return mantis_model
+
+
+@torch.no_grad()
+def encode_with_mantis(
+    mantis_model: Mantis8M,
+    X: np.ndarray,
+    device: torch.device,
+    batch_size: int = 16,
+) -> np.ndarray:
+    """Encode a matrix (n_samples, seq_len) using the provided Mantis encoder."""
+
+    if X.ndim != 3:
+        raise ValueError(f"Mantis encoder expects a 3D array, got shape {X.shape}")
+
+    tensor = torch.from_numpy(np.asarray(X, dtype=np.float32)).to(device)
+    # tensor = tensor.unsqueeze(1)
+    model = MantisTrainer(device=device, network=mantis_model)
+    # outputs = []
+    # for start in range(0, tensor.size(0), batch_size):
+    #     end = start + batch_size
+    #     batch = tensor[start:end]
+    #     reps =  model.transform(batch,to_numpy=True) # mantis_model(batch)
+    #     # outputs.append(reps.cpu())
+    #     outputs.append(reps)
+    z  =   model.transform(tensor,batch_size,to_numpy=True)
+    
+    return z
+
+
+class MantisTabICL(nn.Module):
+    """Composite model that feeds Mantis embeddings into a TabICL backbone."""
+
+    def __init__(
+        self,
+        tabicl_checkpoint: str | Path,
+        mantis_checkpoint: str | Path,
+        mantis_batch_size: int = 32,
+        device: Optional[str | torch.device] = None,
+    ) -> None:
+        super().__init__()
+
+        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.mantis_batch_size = mantis_batch_size
+
+        tabicl_checkpoint = Path(tabicl_checkpoint)
+        mantis_checkpoint = Path(mantis_checkpoint)
+
+        tabicl_state = torch.load(tabicl_checkpoint, map_location="cpu")
+        assert "config" in tabicl_state and "state_dict" in tabicl_state, (
+            "Provided TabICL checkpoint must contain both 'config' and 'state_dict' entries."
+        )
+
+        self.tabicl_model = TabICL(**tabicl_state["config"])
+        self.tabicl_model.load_state_dict(tabicl_state["state_dict"])
+        self.tabicl_model.to(self.device)
+        self.max_classes = self.tabicl_model.max_classes
+        self.tabicl_config = tabicl_state["config"]
+
+        self.mantis_model = Mantis8M(
+            seq_len=512,
+            hidden_dim=256,
+            num_patches=32,
+            scalar_scales=None,
+            hidden_dim_scalar_enc=32,
+            epsilon_scalar_enc=1.1,
+            transf_depth=6,
+            transf_num_heads=8,
+            transf_mlp_dim=512,
+            transf_dim_head=128,
+            transf_dropout=0.1,
+            device=str(self.device),
+            pre_training=False,
+        )
+
+        mantis_state = torch.load(mantis_checkpoint, map_location="cpu")
+        _load_generic_state_dict(self.mantis_model, mantis_state, strict=False)
+        self.mantis_model.to(self.device)
+
+        self.tabicl_model.eval()
+        self.mantis_model.eval()
+
+    def _current_device(self) -> torch.device:
+        return next(self.tabicl_model.parameters()).device
+
+    @torch.no_grad()
+    def _encode_with_mantis(self, X: Tensor, device: Optional[torch.device] = None) -> Tensor:
+        """Run the Mantis encoder over flattened batches to obtain per-row embeddings."""
+        B, T, H = X.shape
+        X = X.reshape(-1, 1, H)
+        representations: List[Tensor] = []
+        device = device or next(self.mantis_model.parameters()).device
+
+        for start in range(0, X.size(0), self.mantis_batch_size):
+            end = start + self.mantis_batch_size
+            batch = X[start:end].to(device)
+            reps = self.mantis_model(batch)
+            representations.append(reps)
+
+        concatenated = torch.cat(representations, dim=0)
+        return concatenated.reshape(B, T, -1)
+
+    def forward(
+        self,
+        X: Tensor,
+        y_train: Tensor,
+        feature_shuffles: Optional[List[List[int]]] = None,
+        embed_with_test: bool = False,
+        return_logits: bool = True,
+        softmax_temperature: float = 0.9,
+        inference_config: Optional[InferenceConfig] = None,
+    ) -> Tensor:
+        device = self._current_device()
+        X = X.to(device).float()
+        y_train = y_train.to(device)
+
+        mantis_device = next(self.mantis_model.parameters()).device
+        mantis_repr = self._encode_with_mantis(X, device=mantis_device)
+        mantis_repr = mantis_repr.float()
+
+        return self.tabicl_model(
+            mantis_repr,
+            y_train,
+            feature_shuffles=feature_shuffles,
+            embed_with_test=embed_with_test,
+            return_logits=return_logits,
+            softmax_temperature=softmax_temperature,
+            inference_config=inference_config,
+        )

@@ -195,22 +195,23 @@ if __name__ == "__main__":
     if torch.cuda.device_count() > 1:
         print(f"Using {torch.cuda.device_count()} GPUs")
         model = torch.nn.DataParallel(model)
+    ###
+    # model = model.to(device)  # 将模型移动到指定设备
     
-    model = model.to(device)  # 将模型移动到指定设备
-    
-    checkpoint = torch.load("/data0/fangjuntao2025/tabicl-main/src/tabicl/checkpointsMantisICL12blocks/step-42300.ckpt", map_location=device, weights_only=True)
+    # checkpoint = torch.load("/data0/fangjuntao2025/tabicl-main/src/tabicl/checkpointsMantisICL12blocks/step-42300.ckpt", map_location=device, weights_only=True)
 
-    # Load model state
-    if "state_dict" not in checkpoint:
-        raise ValueError("Checkpoint does not contain model state")
-    # 修改后
-    state_dict = checkpoint["state_dict"]
-    # 如果模型使用了DataParallel，需要添加module.前缀
-    if isinstance(model, torch.nn.DataParallel):
-        state_dict = {"module." + k: v for k, v in state_dict.items()}
-    model.load_state_dict(state_dict)   
+    # # Load model state
+    # if "state_dict" not in checkpoint:
+    #     raise ValueError("Checkpoint does not contain model state")
+    # # 修改后
+    # state_dict = checkpoint["state_dict"]
+    # # 如果模型使用了DataParallel，需要添加module.前缀
+    # if isinstance(model, torch.nn.DataParallel):
+    #     state_dict = {"module." + k: v for k, v in state_dict.items()}
+    # model.load_state_dict(state_dict)   
     #####
-    """     model.mantis_model  =  model.mantis_model.from_pretrained('`/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint`')  # 加载预训练模型权重
+    model_params = torch.load('/data0/fangjuntao2025/tabicl-main/CaukerImpro-data100k_emb512_100epochs.pt', weights_only=True)
+    model.mantis_model.load_state_dict(model_params)
     try:
         missing, loaded = load_icl_from_checkpoint(model, Path('/data0/fangjuntao2025/tabicl-main/tabICLOrignCheckpoint/tabicl-classifier-v1.1-0506.ckpt'))
         logging.info('Loaded %d icl predictor keys from checkpoint, %d missing', len(loaded), len(missing))
@@ -218,7 +219,7 @@ if __name__ == "__main__":
             logging.info('No matching icl predictor keys found in checkpoint state_dict')
     except Exception as e:
         logging.exception('Failed to map/load icl predictor from checkpoint: %s', e)
-    model = model.to(device) """
+    model = model.to(device)
     #####
     print(f"Model device: {next(model.parameters()).device}")
     # 初始化评估器

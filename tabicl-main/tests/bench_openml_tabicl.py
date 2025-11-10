@@ -215,7 +215,7 @@ def evaluate_openml(data_root: str, model_path: str, outdir: str, max_datasets: 
 
 def main(argv=None):
     p = argparse.ArgumentParser(description='Benchmark TabICL on OpenML-format datasets (TabZilla)')
-    p.add_argument('--data-root', default='/data0/fangjuntao2025/tabzilla-main/TabZilla/datasets', help='Root of OpenML-format datasets')
+    p.add_argument('--data-root', default='/data0/fangjuntao2025/tabzilla-main/TabZilla/tabzill_benchmark', help='Root of OpenML-format datasets')
     p.add_argument('--model-path', default='/data0/fangjuntao2025/tabicl-main/tabICLOrignCheckpoint/tabicl-classifier-v1.1-0506.ckpt', help='Path to TabICL checkpoint')
     p.add_argument('--outdir', default='evaluation_results', help='Output directory for results')
     p.add_argument('--max-datasets', type=int, default=None, help='Limit number of datasets to evaluate')

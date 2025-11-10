@@ -66,7 +66,7 @@ class MantisICL(nn.Module):
         dropout: float = 0.0,
         activation: str | callable = "gelu",
         norm_first: bool = True,
-        icl_dim: int = 256,   #  跟mantis 的 hidden_dim 对应
+        icl_dim: int = 512,   #  跟mantis 的 hidden_dim 对应  256 -> 512
         train_mantis: bool =True,
     ):
         super().__init__()
@@ -85,7 +85,7 @@ class MantisICL(nn.Module):
 
         self.mantis_model = Mantis8M(
             seq_len=512,
-            hidden_dim=256,
+            hidden_dim=512,  # 256 -> 512
             num_patches=32,
             scalar_scales=None,
             hidden_dim_scalar_enc=32,
@@ -100,9 +100,9 @@ class MantisICL(nn.Module):
         )
 
         # 无论 train_mantis True/False，都加载预训练权重
-        pretrained_path = "/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint"
-        self.mantis_model = self.mantis_model.from_pretrained(pretrained_path)
-
+        # pretrained_path = "/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint"
+        # self.mantis_model = self.mantis_model.from_pretrained(pretrained_path)
+        print("mantis 256 -> 512")
         if not self.train_mantis:
             for param in self.mantis_model.parameters():
                 param.requires_grad_(False)

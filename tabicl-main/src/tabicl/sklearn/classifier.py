@@ -21,6 +21,7 @@ from .preprocessing import TransformToNumerical, EnsembleGenerator
 from tabicl import InferenceConfig
 from tabicl import TabICL
 from tabicl import MantisICL
+from tabicl.model.mantis_tabicl import build_mantis_encoder, encode_with_mantis
 
 warnings.filterwarnings("ignore", category=FutureWarning, module="sklearn")
 OLD_SKLEARN = version.parse(sklearn.__version__) < version.parse("1.6")
@@ -92,6 +93,16 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         - If `None` (default), the version specified by `checkpoint_version` is downloaded from
           Hugging Face Hub (repo: 'jingang/TabICL-clf') and cached locally in the default
           Hugging Face cache directory (typically `~/.cache/huggingface/hub`).
+
+        mantis_checkpoint : Optional[str | Path] = None
+                When provided, the classifier first encodes each row with a Mantis8M encoder whose
+                weights are loaded from this path, and feeds the resulting representations into the
+                TabICL backbone. The path must point to a checkpoint compatible with
+                `tabicl.model.mantis_dev.architecture.Mantis8M`.
+
+        mantis_batch_size : int, default=64
+                Micro-batch size used when running the Mantis encoder. Reduce this value when GPU
+                memory is limited.
 
     allow_auto_download: bool = True
         Whether to allow automatic download if the pretrained checkpoint cannot be found at the
@@ -199,6 +210,8 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         n_jobs: Optional[int] = None,
         verbose: bool = False,
         inference_config: Optional[InferenceConfig | Dict] = None,
+        mantis_checkpoint: Optional[str | Path] = None,
+        mantis_batch_size: int = 64,
     ):
         self.n_estimators = n_estimators
         self.norm_methods = norm_methods
@@ -218,6 +231,8 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         self.random_state = random_state
         self.verbose = verbose
         self.inference_config = inference_config
+        self.mantis_checkpoint = mantis_checkpoint  ### jt
+        self.mantis_batch_size = mantis_batch_size  ### JT
 
     def _more_tags(self):
         """Mark classifier as non-deterministic to bypass certain sklearn tests."""
@@ -326,6 +341,45 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         self.model_.load_state_dict(checkpoint["state_dict"])
         self.model_.eval()
 
+    def _ensure_mantis_model(self):
+        """Ensure the auxiliary Mantis encoder is loaded when requested."""
+
+        if self.mantis_checkpoint is None:
+            return
+
+        device = getattr(self, "device_", None)
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        checkpoint_path = Path(self.mantis_checkpoint) if self.mantis_checkpoint is not None else None
+
+        need_load = not hasattr(self, "mantis_model_")
+        if not need_load:
+            if getattr(self, "mantis_device_", None) != device:
+                need_load = True
+            elif getattr(self, "mantis_checkpoint_", None) != checkpoint_path:
+                need_load = True
+
+        if need_load:
+            self.mantis_model_ = build_mantis_encoder(checkpoint_path, device)
+            self.mantis_model_.eval()
+            self.mantis_device_ = device
+            self.mantis_checkpoint_ = checkpoint_path
+
+    def _mantis_encode(self, X: np.ndarray) -> np.ndarray:
+        """Encode the given matrix with the Mantis encoder if enabled."""
+
+        if self.mantis_checkpoint is None:
+            return X
+
+        self._ensure_mantis_model()
+        return encode_with_mantis(
+            self.mantis_model_,
+            np.asarray(X, dtype=np.float32),
+            self.mantis_device_,
+            batch_size=self.mantis_batch_size,
+        )
+
     def fit(self, X, y):
         """Fit the classifier to training data.
 
@@ -430,6 +484,9 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         #  Transform input features
         self.X_encoder_ = TransformToNumerical(verbose=self.verbose)
         X = self.X_encoder_.fit_transform(X)
+        X = np.asarray(X, dtype=np.float32)
+        if self.mantis_checkpoint is not None:
+            X = self._mantis_encode(X)
 
         # Fit ensemble generator to create multiple dataset views
         self.ensemble_generator_ = EnsembleGenerator(
@@ -554,6 +611,9 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
             X = self._validate_data(X, reset=False, dtype=None, skip_check_array=True)
 
         X = self.X_encoder_.transform(X)
+        X = np.asarray(X, dtype=np.float32)
+        if self.mantis_checkpoint is not None:
+            X = self._mantis_encode(X)
 
         data = self.ensemble_generator_.transform(X)
         outputs = []

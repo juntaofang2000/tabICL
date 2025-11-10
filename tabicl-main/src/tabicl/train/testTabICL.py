@@ -146,7 +146,7 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)  # 将模型移动到指定设备
     
-    checkpoint = torch.load("/data0/fangjuntao2025/tabicl-main/tabICLOrignCheckpoint/tabicl-classifier-v1.1-0506.ckpt", map_location=device, weights_only=True)  #"/data0/fangjuntao2025/tabicl-main/src/tabicl/checkpoints/step-23800.ckpt"
+    checkpoint = torch.load("/data0/fangjuntao2025/tabicl-main/checkpoints/step-9900.ckpt", map_location=device, weights_only=True)  #"/data0/fangjuntao2025/tabicl-main/src/tabicl/checkpoints/step-23800.ckpt"
 
     # Load model state
     if "state_dict" not in checkpoint:

@@ -12,26 +12,64 @@ from .reading_utils.preprocessing_utils import *
 
 
 class DataReader:
-    """_summary_
+    """统一读取 UCR / UEA 等时序数据集的工具。
 
-        Args:
-            data_path: 
-                Path to the folder with datasets. Defaults to '/data/'.
-            transform_ts_size: 
-                To which sequence length resize time series. Defaults to 512.
-                If None, it doesn't transform time series and keep the original size.
-            resize_func: 
-                Resize function. By default, interpolate function.
-            univariate: 
-                If True, reshapes data from (n_samples, n_channels, seq_len) to (n_samples, n_channels * seq_len).
-        """
-    def __init__(self, data_path='/data/', transform_ts_size=512, resize_func=None, univariate=False):
-        self.data_path = data_path
+    参数说明
+    ----------
+    UCR_data_path : str
+        UCR 数据根目录路径，内部会在其下拼接 ``UCRArchive_2018/``。
+    UEA_data_path : str
+        UEA 数据根目录路径，内部会在其下拼接 ``UEA/``。
+    transform_ts_size : int | None
+        将所有时间序列统一插值到的长度（默认 512）。
+        - 如果为 None，则不调整长度，保持原始序列长度。
+    resize_func : callable | None
+        自定义序列重采样函数，签名形如 ``resize_func(X: torch.Tensor) -> torch.Tensor``，
+        其中 ``X`` 的形状为 ``[batch, channels, seq_len]``。
+        - 若为 None，默认使用 ``torch.nn.functional.interpolate`` 做线性插值。
+    univariate : bool
+        若为 True，则把形状从 ``(n_samples, n_channels, seq_len)`` 重排为
+        ``(n_samples * n_channels, 1, seq_len)``，即把多通道展开为多个单通道样本。
+    nan_fill_mode : str
+        控制在读取 UEA ``.ts`` 文件时如何处理 NaN。
+        目前支持：
+        - ``"zero"`` （默认）：先将 NaN 用 0 填充（通过 ``set_nan_to_zero``），
+          再统一对齐长度并线性插值到 ``transform_ts_size``。
+        - 预留扩展位（例如 "mean"、"forward_fill" 等），后续可在 ``_read_ts_files``
+          中根据该参数实现更复杂的插值策略。
+
+    数据处理流程简要说明
+    ----------------------
+    对 UEA 数据集，调用 :meth:`_read_ts_files` 时会：
+
+    1. 读取原始 ``.ts`` 文件，得到形状约为 ``[n_samples, n_channels, seq_len]`` 的张量 ``X``；
+    2. 根据 ``nan_fill_mode`` 对 ``X`` 中的 NaN 做预处理（默认全部置 0）；
+    3. 若设置了 ``univariate=True``，则展平通道维度；
+    4. 使用 ``resize_func`` 将每个样本沿时间维线性插值 / 重采样到长度
+       ``transform_ts_size``，从而得到对齐到统一长度的序列表示。
+    """
+
+    def __init__(self, UCR_data_path='/data/', UEA_data_path='/data2/', transform_ts_size=512,
+                 resize_func=None, univariate=False, nan_fill_mode: str = "zero",
+                 log_processing: bool = False):
+        self.UCR_data_path = UCR_data_path
+        self.UEA_data_path = UEA_data_path
+        self.UniTS_data_path = None
         self.transform_ts_size = transform_ts_size
+
+        # 说明：默认重采样函数为沿时间维线性插值到 transform_ts_size 长度。
+        # 也就是说，先保证每个样本的时序长度对齐，然后统一插值为指定长度。
         if resize_func is None:
             self.resize_func = lambda X: F.interpolate(X, size=self.transform_ts_size, mode='linear', align_corners=False)
         else:
             self.resize_func = resize_func
+
+        # NaN 处理策略（目前在 _read_ts_files 中使用）
+        self.nan_fill_mode = nan_fill_mode
+
+        # 是否打印数据预处理方式（数据集名、NaN 处理方式、插值长度等）。
+        self.log_processing = log_processing
+
         self.univariate = univariate
         self._get_dataset_lists()
 
@@ -51,13 +89,14 @@ class DataReader:
 
     #     self.classification_datasets = self.dataset_list_ucr + self.dataset_list_uea + self.dataset_list_units + self.dataset_list_others
     def _get_dataset_lists(self,):
-        self.dataset_list_ucr = os.listdir(self.data_path + "UCRArchive_2018/")
-
+        self.dataset_list_ucr = os.listdir(self.UCR_data_path + "UCRArchive_2018/")
+        self.dataset_list_uea = os.listdir(self.UEA_data_path + "UEA/")
+        
         # self.dataset_list_forecasting = ['ETTh1', 'ETTh2', 'ETTm1', 'ETTm2', 'Electricity', 'ExchangeRate', 
         #                                  'Illness', 'Traffic', 'Weather']
 
 
-        self.classification_datasets = self.dataset_list_ucr
+        self.classification_datasets =  self.dataset_list_uea + self.dataset_list_ucr
     
     def _get_dataset_collection(self, dataset_name):
         if dataset_name in self.dataset_list_uea:
@@ -82,14 +121,23 @@ class DataReader:
 
         # UCR
         if dataset_name in self.dataset_list_ucr:
+            if self.log_processing:
+                print(f"[DataReader] Loading UCR dataset '{dataset_name}' (set={which_set}), "
+                      f"resize_to={self.transform_ts_size}, nan_fill_mode=not_applicable")
             data = self._read_ucr_dataset(dataset_name, which_set=which_set)
         # UEA
         elif dataset_name in self.dataset_list_uea:
+            if self.log_processing:
+                print(f"[DataReader] Loading UEA dataset '{dataset_name}' (set={which_set}), "
+                      f"nan_fill_mode={self.nan_fill_mode}, resize_to={self.transform_ts_size}")
+            # Use time-series reader for UEA datasets. For InsectWingbeatSubset we
+            # will additionally subsample to a fixed-size split for benchmarking.
             read_func = self._read_npy_files if dataset_name == 'InsectWingbeatSubset' else self._read_ts_files
-            data = read_func(dataset_name, collection='UEA', which_set=which_set, channel_idx=channel_idx)
+            data = read_func(self.UEA_data_path, dataset_name, collection='UEA', which_set=which_set, channel_idx=channel_idx)
+        # UniTS
         # Datasets from UniTS paper
         elif dataset_name in self.dataset_list_units:
-            data = self._read_ts_files(dataset_name, collection='UniTS', which_set=which_set, channel_idx=channel_idx)
+            data = self._read_ts_files(self.UniTS_data_path,dataset_name, collection='UniTS', which_set=which_set, channel_idx=channel_idx)
         # Other datasets used in pre-training
         elif dataset_name in self.dataset_list_others:
             data = self._read_other_dataset(dataset_name, which_set=which_set, channel_idx=channel_idx)
@@ -130,7 +178,7 @@ class DataReader:
         else:
             raise KeyError('This collection has only train and test sets.')
 
-        file_name = os.path.join(self.data_path + "UCRArchive_2018/", dataset_name, dataset_name + filename_suffix)
+        file_name = os.path.join(self.UCR_data_path + "UCRArchive_2018/", dataset_name, dataset_name + filename_suffix)
         data = pd.read_csv(file_name, sep='\t', header=None).to_numpy()
         X, y = torch.tensor(data[:, 1:], dtype=torch.float), data[:, 0]
         X = X.unsqueeze(-2)
@@ -141,7 +189,7 @@ class DataReader:
 
         return X.numpy(), y
     
-    def _read_npy_files(self, dataset_name, collection, which_set, channel_idx=None):
+    def _read_npy_files(self, data_path, dataset_name, collection, which_set, channel_idx=None):
         if which_set == 'train':
             filename_suffix = '_train.npy'
         elif which_set == 'test':
@@ -149,8 +197,13 @@ class DataReader:
         else:
             raise KeyError('This collection has only train and test sets.')
 
-        base_path = os.path.join(self.data_path, collection, dataset_name)
+        base_path = os.path.join(data_path, collection, dataset_name)
         X, y = [np.load(base_path + '/' + s + filename_suffix) for s in ['x', 'y']]
+        if self.nan_fill_mode == "zero":
+            X = set_nan_to_zero(X)
+        else:
+            # 预留其他模式，例如按均值填充、前向填充等
+            X = set_nan_to_zero(X)
         X = torch.tensor(X, dtype=torch.float)
 
         # select only this channel if specified
@@ -173,7 +226,7 @@ class DataReader:
         return X.numpy(), y
     
 
-    def _read_ts_files(self, dataset_name, collection, which_set, channel_idx=None):
+    def _read_ts_files(self, data_path,dataset_name, collection, which_set, channel_idx=None):
         if which_set == 'train':
             filename_suffix = '_TRAIN.ts'
         elif which_set == 'test':
@@ -181,11 +234,20 @@ class DataReader:
         else:
             raise KeyError('This collection has only train and test sets.')
 
-        file_name = os.path.join(self.data_path, collection, dataset_name, dataset_name + filename_suffix)
+        file_name = os.path.join(data_path, collection, dataset_name, dataset_name + filename_suffix)
 
         label_dict = get_label_dict(file_name)
         X, y = get_data_and_label_from_ts_file(file_name, label_dict)
-        X = set_nan_to_zero(X)
+
+        # 先根据 nan_fill_mode 处理 NaN。
+        # 当前仅实现 "zero"：将所有 NaN 置 0，便于后续插值；
+        # 如需更复杂的插值策略，可在此分支中扩展。
+        if self.nan_fill_mode == "zero":
+            X = set_nan_to_zero(X)
+        else:
+            # 预留其他模式，例如按均值填充、前向填充等
+            X = set_nan_to_zero(X)
+
         X = torch.tensor(X, dtype=torch.float)
 
         # select only this channel if specified
@@ -207,6 +269,26 @@ class DataReader:
             X = self.resize_func(X)
         
         return X.numpy(), y
+
+    # def _subsample_split(self, data, which_set, max_samples: int = 1000, base_seed: int = 12345):
+    #     """Subsample X/y to at most `max_samples` rows using a fixed RNG seed.
+
+    #     Keeps X/y aligned. `which_set` chooses an offset so train/test use different
+    #     but deterministic seeds.
+    #     """
+    #     X, y = data
+    #     X = np.asarray(X)
+    #     y = np.asarray(y)
+
+    #     total = len(y)
+    #     if total <= max_samples:
+    #         return X, y
+
+    #     offset = {'train': 0, 'test': 1, 'val': 2}.get(which_set, 3)
+    #     rng = np.random.default_rng(base_seed + offset)
+    #     indices = rng.choice(total, size=max_samples, replace=False)
+
+    #     return X[indices], y[indices]
         
     def _read_other_dataset(self, dataset_name, which_set, channel_idx=None):
         if which_set == 'train':
