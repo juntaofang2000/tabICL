@@ -11,7 +11,6 @@ from .inference_config import InferenceConfig
 from tabicl.model.mantis_dev.architecture.architecture import Mantis8M
 import torch
 
-
 class MantisICL(nn.Module):
     """A Tabular In-Context Learning Foundation Model.
 
@@ -59,16 +58,16 @@ class MantisICL(nn.Module):
     """
 
     def __init__(
-            self,
-            max_classes: int = 60,
-            icl_num_blocks: int = 12,
-            icl_nhead: int = 4,
-            ff_factor: int = 2,
-            dropout: float = 0.0,
-            activation: str | callable = "gelu",
-            norm_first: bool = True,
-            icl_dim: int = 256,  # 跟mantis 的 hidden_dim 对应  256-》 512
-            train_mantis: bool = True,
+        self,
+        max_classes: int = 60,
+        icl_num_blocks: int = 12,
+        icl_nhead: int = 4,
+        ff_factor: int = 2,
+        dropout: float = 0.0,
+        activation: str | callable = "gelu",
+        norm_first: bool = True,
+        icl_dim: int = 512,   #  跟mantis 的 hidden_dim 对应  256-》 512
+        train_mantis: bool =True,
     ):
         super().__init__()
         self.max_classes = max_classes
@@ -86,7 +85,7 @@ class MantisICL(nn.Module):
 
         self.mantis_model = Mantis8M(
             seq_len=512,
-            hidden_dim=256,
+            hidden_dim=512,
             num_patches=32,
             scalar_scales=None,
             hidden_dim_scalar_enc=32,
@@ -99,9 +98,10 @@ class MantisICL(nn.Module):
             device="cuda" if torch.cuda.is_available() else "cpu",
             pre_training=False  # forward 的时候没有 prj 头
         )
+        print("Mantis 修改 hidden_dim 从256 变为512")
         # 无论 train_mantis True/False，都加载预训练权重
-        pretrained_path = "/home/hzf00006536/fjt/CauKer/Models/Mantis/Mantis_cheickpoint"
-        self.mantis_model = self.mantis_model.from_pretrained(pretrained_path)
+        #pretrained_path = "/home/hzf00006536/fjt/CauKer/Models/Mantis/Mantis_cheickpoint"
+        #self.mantis_model = self.mantis_model.from_pretrained(pretrained_path)
 
         if not self.train_mantis:
             for param in self.mantis_model.parameters():
@@ -137,7 +137,7 @@ class MantisICL(nn.Module):
         )
 
     def _train_forward(
-            self, X: Tensor, y_train: Tensor, d: Optional[Tensor] = None, embed_with_test: bool = False
+        self, X: Tensor, y_train: Tensor, d: Optional[Tensor] = None, embed_with_test: bool = False
     ) -> Tensor:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning for training.
 
@@ -145,9 +145,9 @@ class MantisICL(nn.Module):
         ----------
         X : Tensor
             Input tensor of shape (B, T, H) where:
-             - B is the number of tables      数据集数量
+             - B is the number of tables      数据集数量    
              - T is the number of samples (rows)  一条时序
-             - H is the number of features (columns)  时序长度(embeding 特征数)： 512
+             - H is the number of features (columns)  时序长度(embeding 特征数)： 512 
             The first train_size positions contain training samples, and the remaining positions contain test samples.
 
         y_train : Tensor
@@ -194,21 +194,21 @@ class MantisICL(nn.Module):
         # for name, param in self.named_parameters():
         #     if not param.requires_grad:
         #         print(f"Parameter {name} is frozen and unused.")
-
+                
         # print(f"Mantis8M parameters used: {self.mantis_model.training}")
         # print(f"ICLearning parameters used: {self.icl_predictor.training}")
 
         return out
 
     def _inference_forward(
-            self,
-            X: Tensor,
-            y_train: Tensor,
-            feature_shuffles: Optional[List[List[int]]] = None,
-            embed_with_test: bool = False,
-            return_logits: bool = True,
-            softmax_temperature: float = 0.9,
-            inference_config: InferenceConfig = None,
+        self,
+        X: Tensor,
+        y_train: Tensor,
+        feature_shuffles: Optional[List[List[int]]] = None,
+        embed_with_test: bool = False,
+        return_logits: bool = True,
+        softmax_temperature: float = 0.9,
+        inference_config: InferenceConfig = None,
     ) -> Tensor:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning.
 
@@ -257,15 +257,15 @@ class MantisICL(nn.Module):
             inference_config = InferenceConfig()
 
         # # Split X into T sub-tensors of shape [B, 1, H]
-        # X_split = torch.split(X, 1, dim=1)  # List of [B, 1, H] tensors  #
+        # X_split = torch.split(X, 1, dim=1)  # List of [B, 1, H] tensors  # 
 
         # self.mantis_model.pre_training  =  False
         # # Process each sub-tensor through Mantis8M and collect representations
         # representations = []
         # for x in X_split:
         #     # x shape: [B, 1, H]
-        #     rep = self.mantis_model(x)
-        #     rep = rep.unsqueeze(1)  # rep shape: [B, 1, D]
+        #     rep = self.mantis_model(x)  
+        #     rep = rep.unsqueeze(1)  # rep shape: [B, 1, D] 
         #     representations.append(rep)
 
         # # Concatenate all representations along the sequence dimension
@@ -276,7 +276,8 @@ class MantisICL(nn.Module):
         self.mantis_model.pre_training = False
         # representations = self.mantis_model(X_reshaped)  # rep shape: [B*T, D]
         # representations = representations.view(B, T, -1)  # Reshape back to [B, T, D]
-
+        
+        
         # 修改后
         batch_size = 32  # 可根据GPU内存调整
         BT = X_reshaped.shape[0]
@@ -289,7 +290,7 @@ class MantisICL(nn.Module):
             representations_list.append(batch_rep)
 
         representations = torch.cat(representations_list, dim=0)  # [B*T, D]
-        representations = representations.reshape(B, T, -1)
+        representations = representations.reshape(B, T, -1)          
         # Dataset-wise in-context learning
         out = self.icl_predictor(
             representations,
@@ -302,15 +303,15 @@ class MantisICL(nn.Module):
         return out
 
     def forward(
-            self,
-            X: Tensor,
-            y_train: Tensor,
-            d: Optional[Tensor] = None,
-            feature_shuffles: Optional[List[List[int]]] = None,
-            embed_with_test: bool = False,
-            return_logits: bool = True,
-            softmax_temperature: float = 0.9,
-            inference_config: InferenceConfig = None,
+        self,
+        X: Tensor,
+        y_train: Tensor,
+        d: Optional[Tensor] = None,
+        feature_shuffles: Optional[List[List[int]]] = None,
+        embed_with_test: bool = False,
+        return_logits: bool = True,
+        softmax_temperature: float = 0.9,
+        inference_config: InferenceConfig = None,
     ) -> Tensor:
         """Column-wise embedding -> row-wise interaction -> dataset-wise in-context learning.
 
