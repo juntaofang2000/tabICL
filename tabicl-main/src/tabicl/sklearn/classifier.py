@@ -124,6 +124,15 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         Device to use for inference. If None, defaults to CUDA if available, else CPU.
         Can be specified as a string ('cuda', 'cpu') or a torch.device object.
 
+        multi_gpu : bool, default=False
+        When True and multiple CUDA devices are available, wraps the TabICL backbone in
+        ``torch.nn.DataParallel`` so ensemble batches are automatically split across
+        GPUs. This reduces per-device memory usage at the cost of additional overhead.
+
+    multi_gpu_device_ids : Optional[list[int]] = None
+        Explicit CUDA device indices to use when ``multi_gpu`` is enabled. When ``None``,
+        all visible CUDA devices are used. Invalid indices are ignored.
+
     random_state : int | None = 42
         Random seed for reproducibility of ensemble generation, affecting feature
         shuffling and other randomized operations.
@@ -212,6 +221,8 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         inference_config: Optional[InferenceConfig | Dict] = None,
         mantis_checkpoint: Optional[str | Path] = None,
         mantis_batch_size: int = 64,
+        multi_gpu: bool = False,
+        multi_gpu_device_ids: Optional[List[int]] = None,
     ):
         self.n_estimators = n_estimators
         self.norm_methods = norm_methods
@@ -233,6 +244,9 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         self.inference_config = inference_config
         self.mantis_checkpoint = mantis_checkpoint  ### jt
         self.mantis_batch_size = mantis_batch_size  ### JT
+        self.multi_gpu = multi_gpu
+        self.multi_gpu_device_ids = multi_gpu_device_ids
+        self._active_data_parallel_devices = None
 
     def _more_tags(self):
         """Mark classifier as non-deterministic to bypass certain sklearn tests."""
@@ -242,6 +256,31 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         tags = super().__sklearn_tags__()
         tags.non_deterministic = True
         return tags
+
+    def _get_core_model(self):
+        """Return the underlying TabICL module (unwraps DataParallel wrappers)."""
+
+        model = getattr(self, "model_", None)
+        if isinstance(model, torch.nn.DataParallel):
+            return model.module
+        return model
+
+    def _resolve_data_parallel_devices(self) -> List[int]:
+        """Select device ids for DataParallel, honoring user overrides when valid."""
+
+        available = torch.cuda.device_count()
+        if available <= 1:
+            return []
+
+        if self.multi_gpu_device_ids is None:
+            device_ids = list(range(available))
+        else:
+            device_ids = [int(idx) for idx in self.multi_gpu_device_ids if 0 <= int(idx) < available]
+
+        if len(device_ids) <= 1:
+            return []
+
+        return device_ids
 
     def _load_model(self):
         """Load a model from a given path or download it if not available.
@@ -439,6 +478,14 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
 
         if need_load:
             self._load_model()
+        if self.multi_gpu and torch.cuda.device_count() > 1:
+            if not isinstance(self.model_, torch.nn.DataParallel):
+                device_ids = self._resolve_data_parallel_devices()
+                if device_ids:
+                    self.model_ = torch.nn.DataParallel(self.model_, device_ids=device_ids)
+                    self._active_data_parallel_devices = device_ids
+                    if self.verbose:
+                        print(f"[TabICLClassifier] DataParallel enabled on devices: {device_ids}")
         # Move model to device (safe if already on device)
         self.model_.to(self.device_)
 
@@ -469,15 +516,20 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         self.classes_ = self.y_encoder_.classes_
         self.n_classes_ = len(self.y_encoder_.classes_)
 
-        if self.n_classes_ > self.model_.max_classes and not self.use_hierarchical:
+        core_model = self._get_core_model()
+        if core_model is None or not hasattr(core_model, "max_classes"):
+            raise AttributeError("Loaded TabICL model is missing the required 'max_classes' attribute.")
+        model_max_classes = core_model.max_classes
+
+        if self.n_classes_ > model_max_classes and not self.use_hierarchical:
             raise ValueError(
-                f"The number of classes ({self.n_classes_}) exceeds the max number of classes ({self.model_.max_classes}) "
+                f"The number of classes ({self.n_classes_}) exceeds the max number of classes ({model_max_classes}) "
                 f"natively supported by the model. Consider enabling hierarchical classification."
             )
 
-        if self.n_classes_ > self.model_.max_classes and self.verbose:
+        if self.n_classes_ > model_max_classes and self.verbose:
             print(
-                f"The number of classes ({self.n_classes_}) exceeds the max number of classes ({self.model_.max_classes}) "
+                f"The number of classes ({self.n_classes_}) exceeds the max number of classes ({model_max_classes}) "
                 f"natively supported by the model. Therefore, hierarchical classification is used."
             )
 
@@ -528,24 +580,56 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
             where test_size = n_samples - train_size.
         """
 
-        batch_size = self.batch_size or Xs.shape[0]
-        n_batches = np.ceil(Xs.shape[0] / batch_size)
-        Xs = np.array_split(Xs, n_batches)
-        ys = np.array_split(ys, n_batches)
+        initial_batch_size = self.batch_size or Xs.shape[0]
+        batch_size = max(1, int(initial_batch_size))
+
+        while True:
+            try:
+                return self._batch_forward_once(Xs, ys, shuffle_patterns, batch_size)
+            except Exception as exc:
+                if not self._is_oom_error(exc) or batch_size == 1:
+                    raise
+                if self.verbose:
+                    print(f"[TabICLClassifier] OOM detected during inference, retrying with batch_size={batch_size // 2}.")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                batch_size = max(1, batch_size // 2)
+
+    def _batch_forward_once(self, Xs, ys, shuffle_patterns, batch_size: int):
+        """Single forward pass over ensemble batches with a fixed batch size."""
+
+        n_batches = int(np.ceil(Xs.shape[0] / batch_size))
+        X_chunks = np.array_split(Xs, n_batches)
+        y_chunks = np.array_split(ys, n_batches)
         if shuffle_patterns is None:
-            shuffle_patterns = [None] * n_batches
+            shuffle_chunks = [None] * n_batches
         else:
-            shuffle_patterns = np.array_split(shuffle_patterns, n_batches)
+            shuffle_chunks = np.array_split(shuffle_patterns, n_batches)
+
+        use_data_parallel = isinstance(self.model_, torch.nn.DataParallel)
+        dp_replicas = len(self._active_data_parallel_devices or [])
+        core_model = self._get_core_model()
 
         outputs = []
-        for X_batch, y_batch, pattern_batch in zip(Xs, ys, shuffle_patterns):
+        for X_batch, y_batch, pattern_batch in zip(X_chunks, y_chunks, shuffle_chunks):
             X_batch = torch.from_numpy(X_batch).float().to(self.device_)
             y_batch = torch.from_numpy(y_batch).float().to(self.device_)
             if pattern_batch is not None:
                 pattern_batch = pattern_batch.tolist()
 
+            model_to_use = self.model_
+            # Avoid DataParallel when batch has fewer tables than replicas (would drop positional args)
+            if use_data_parallel:
+                if dp_replicas < 2 or X_batch.shape[0] < dp_replicas:
+                    model_to_use = core_model
+            else:
+                model_to_use = core_model
+
+            if model_to_use is None:
+                raise RuntimeError("TabICL backbone is not initialized before inference.")
+
             with torch.no_grad():
-                out = self.model_(
+                out = model_to_use(
                     X_batch,
                     y_batch,
                     feature_shuffles=pattern_batch,
@@ -556,6 +640,15 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
             outputs.append(out.float().cpu().numpy())
 
         return np.concatenate(outputs, axis=0)
+
+    @staticmethod
+    def _is_oom_error(exc: Exception) -> bool:
+        """Return True if the exception corresponds to a CUDA OOM."""
+
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            return True
+        msg = str(exc).lower()
+        return "out of memory" in msg and "cuda" in msg
 
     def predict_proba(self, X):
         """Predict class probabilities for test samples.

@@ -1,3 +1,4 @@
+import argparse
 import json
 import torch
 import numpy as np
@@ -11,14 +12,16 @@ from tabicl.prior.data_reader import DataReader
 
 MANTIS_CHECKPOINT ="/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/checkpoint/CaukerMixed-data100k_200_2e-3_100epochs.pt"
 TABICL_CHECKPOINT = "/data0/fangjuntao2025/tabicl-main/tabICLOrignCheckpoint/tabicl-classifier-v1.1-0506.ckpt"
-BATCHSIZE =  4
-MAXWORKERS = 1
+DEFAULT_UEA_PATH = "/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UEAData/"
+DEFAULT_UCR_PATH = "/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UCRdata/"
+BATCHSIZE =   32
+MAXWORKERS = 3
 # Module-level worker helpers for multiprocessing (must be picklable / top-level)
 WORKER_READER = None
 WORKER_CLF = None
 WORKER_USE_MANTIS = False
 USE_PARALLEL_EVAL = os.environ.get("TABICL_USE_MULTIGPU", "1") == "1"
-
+# USE_PARALLEL_EVAL = 0
 
 SKIP_UEA_DATASETS = {
     "AtrialFibrillation",
@@ -104,6 +107,14 @@ def _worker_eval(dataset_name):
         acc = float(np.mean(y_pred == y_test))
         print(f"{dataset_name} accuracy: {acc:.4f}")
         return (dataset_name, acc, None)
+    except torch.cuda.OutOfMemoryError as oom:
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        msg = f"CUDA OOM for {dataset_name}: {oom}"
+        print(msg)
+        return (dataset_name, 0.0, msg)
     except Exception as e:
         return (dataset_name, 0.0, str(e))
 
@@ -238,6 +249,13 @@ class UCR_UEAEvaluator:
 
             return accuracy
 
+        except torch.cuda.OutOfMemoryError as oom:
+            print(f"[SKIP] {dataset_name} -> CUDA OOM: {oom}")
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+            return 0.0
         except Exception as e:
             print(f"Failed to evaluate dataset {dataset_name}: {e}")
             return 0.0
@@ -442,13 +460,31 @@ def batch_test_ucr(ucr_root, use_mantis: bool = True):
         print("无有效数据集被评测！")
 
 
+def _parse_args():
+    parser = argparse.ArgumentParser(
+        description="Evaluate TabICL on UEA/UCR datasets with optional CLI overrides."
+    )
+    parser.add_argument(
+        "--uea-path",
+        default=DEFAULT_UEA_PATH,
+        help=f"UEA dataset root directory (default: {DEFAULT_UEA_PATH})",
+    )
+    parser.add_argument(
+        "--ucr-path",
+        default=DEFAULT_UCR_PATH,
+        help=f"UCR dataset root directory (default: {DEFAULT_UCR_PATH})",
+    )
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
+    args = _parse_args()
     evaluator = UCR_UEAEvaluator(
-        UEA_data_path="/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UEAData/",
-        UCR_data_path="/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UCRdata/",
+        UEA_data_path=args.uea_path,
+        UCR_data_path=args.ucr_path,
         mantis_batch_size=BATCHSIZE,
-        use_mantis  = WORKER_USE_MANTIS,   # 只使用tabicl模型
-        log_processing= True
+        use_mantis=WORKER_USE_MANTIS,
+        log_processing=True,
     )
     # target_datasets = [
     #     "BasicMotions",
@@ -459,11 +495,11 @@ if __name__ == "__main__":
     #     "PEMS-SF",
     # ]
     # 1) 遍历所有 UEA 数据集，逐个评测并记录结果
-    #dataset_names = sorted(evaluator.reader.dataset_list_uea)
-    dataset_names = [
-        name for name in sorted(evaluator.reader.dataset_list_uea)
-        if name not in SKIP_UEA_DATASETS
-    ]
+    dataset_names = sorted(evaluator.reader.dataset_list_uea)
+    # dataset_names = [
+    #     name for name in sorted(evaluator.reader.dataset_list_uea)
+    #     if name not in SKIP_UEA_DATASETS
+    # ]
     all_uea_results = []
 
     if USE_PARALLEL_EVAL:
@@ -494,11 +530,11 @@ if __name__ == "__main__":
         avg_acc = sum(v for _, v in all_uea_results) / len(all_uea_results)
         print(f"\nAll UEA datasets evaluated: {len(all_uea_results)}, average accuracy: {avg_acc:.4f}")
 
-        with open(results_dir / "uea_all_detailed.txt", "w") as f:
+        with open(results_dir / "TabICL_uea_all_detailed.txt", "w") as f:
             for name, val in all_uea_results:
                 f.write(f"{name}: {val:.6f}\n")
 
-        with open(results_dir / "uea_all_summary.txt", "w") as f:
+        with open(results_dir / "TabICL_uea_all_summary.txt", "w") as f:
             f.write(f"Total datasets: {len(all_uea_results)}\n")
             f.write(f"Average accuracy: {avg_acc:.6f}\n")
     else:
