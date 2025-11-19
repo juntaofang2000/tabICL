@@ -14,12 +14,14 @@ MANTIS_CHECKPOINT ="/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/
 TABICL_CHECKPOINT = "/data0/fangjuntao2025/tabicl-main/tabICLOrignCheckpoint/tabicl-classifier-v1.1-0506.ckpt"
 DEFAULT_UEA_PATH = "/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UEAData/"
 DEFAULT_UCR_PATH = "/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UCRdata/"
+DEFAULT_RESULTS_DIR = "evaluation_results"
 BATCHSIZE =   32
 MAXWORKERS = 3
+WORKER_USE_MANTIS = False
 # Module-level worker helpers for multiprocessing (must be picklable / top-level)
 WORKER_READER = None
 WORKER_CLF = None
-WORKER_USE_MANTIS = False
+
 USE_PARALLEL_EVAL = os.environ.get("TABICL_USE_MULTIGPU", "1") == "1"
 # USE_PARALLEL_EVAL = 0
 
@@ -156,7 +158,11 @@ class UCR_UEAEvaluator:
                  UCR_data_path: str = "/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UCRdata/",
                  use_mantis: bool = True,
                  mantis_batch_size: int = 64,
-                 log_processing: bool = False):
+                 log_processing: bool = False,
+                 tabicl_ckpt: str = TABICL_CHECKPOINT,
+                 mantis_ckpt: str = MANTIS_CHECKPOINT,
+                 results_dir: str = DEFAULT_RESULTS_DIR,
+                 max_workers: int = MAXWORKERS):
         """
         初始化评估器。
 
@@ -184,16 +190,22 @@ class UCR_UEAEvaluator:
         self.stats = []
         self.use_mantis = use_mantis
         self.mantis_batch_size = mantis_batch_size
+        self.tabicl_ckpt = tabicl_ckpt
+        self.mantis_ckpt = mantis_ckpt
+        self.results_dir = Path(results_dir)
+        self.results_dir.mkdir(parents=True, exist_ok=True)
+        self.max_workers = max(1, max_workers)
+
         # Instantiate classifier once to avoid re-loading the heavy checkpoint repeatedly.
         classifier_kwargs = dict(
             verbose=False,
             n_estimators=32,
             checkpoint_version="tabicl-classifier-v1.1-0506.ckpt",
-            model_path=TABICL_CHECKPOINT,
+            model_path=self.tabicl_ckpt,
         )
         if self.use_mantis:
             classifier_kwargs.update(
-                mantis_checkpoint=MANTIS_CHECKPOINT,
+                mantis_checkpoint=self.mantis_ckpt,
                 mantis_batch_size=self.mantis_batch_size,
             )
         # keep a single classifier instance; fit() will overwrite dataset-specific
@@ -206,8 +218,8 @@ class UCR_UEAEvaluator:
             ucr_path=UCR_data_path,
             use_mantis=self.use_mantis,
             mantis_batch_size=self.mantis_batch_size,
-            tabicl_ckpt=TABICL_CHECKPOINT,
-            mantis_ckpt=MANTIS_CHECKPOINT,
+            tabicl_ckpt=self.tabicl_ckpt,
+            mantis_ckpt=self.mantis_ckpt,
             transform_ts_size=512,
         )
 
@@ -291,7 +303,7 @@ class UCR_UEAEvaluator:
         # Parallel evaluation using process pool: each worker will initialize its own
         # DataReader and TabICLClassifier once (see module-level _worker_init/_worker_eval).
         # To reduce GPU OOM risk, cap the number of workers.
-        max_workers = MAXWORKERS
+        max_workers = self.max_workers
         n_jobs = min(max_workers, mp.cpu_count() or 1, max(1, (len(self.reader.dataset_list_ucr) + len(self.reader.dataset_list_uea)) // 2))
         ctx = mp.get_context('spawn')
         with ctx.Pool(processes=n_jobs, initializer=_worker_init, initargs=(
@@ -327,8 +339,7 @@ class UCR_UEAEvaluator:
         if ucr_results:
             ucr_avg = sum(v for _, v in ucr_results) / len(ucr_results)
             print(f"\nUCR: evaluated {len(ucr_results)} datasets, average accuracy: {ucr_avg:.4f}")
-            results_dir = Path("evaluation_results")
-            results_dir.mkdir(exist_ok=True)
+            results_dir = self.results_dir
             with open(results_dir / "ucr_detailed.txt", "w") as f:
                 for name, val in ucr_results:
                     f.write(f"{name}: {val:.6f}\n")
@@ -341,8 +352,7 @@ class UCR_UEAEvaluator:
         if uea_results:
             uea_avg = sum(v for _, v in uea_results) / len(uea_results)
             print(f"\nUEA: evaluated {len(uea_results)} datasets, average accuracy: {uea_avg:.4f}")
-            results_dir = Path("evaluation_results")
-            results_dir.mkdir(exist_ok=True)
+            results_dir = self.results_dir
             with open(results_dir / "uea_detailed.txt", "w") as f:
                 for name, val in uea_results:
                     f.write(f"{name}: {val:.6f}\n")
@@ -359,8 +369,7 @@ class UCR_UEAEvaluator:
         """
         保存评估结果到文件。
         """
-        results_dir = Path("evaluation_results")
-        results_dir.mkdir(exist_ok=True)
+        results_dir = self.results_dir
         
         # 保存详细结果
         with open(results_dir / "detailed_results.txt", "w") as f:
@@ -410,7 +419,12 @@ def read_ucr_tsv(train_path, test_path):  # 不改变时序数据的长度
     X_test = test_df.iloc[:, 1:].values
     return X_train, y_train, X_test, y_test
     
-def batch_test_ucr(ucr_root, use_mantis: bool = True):
+def batch_test_ucr(ucr_root,
+                   use_mantis: bool = True,
+                   tabicl_ckpt: str = TABICL_CHECKPOINT,
+                   mantis_ckpt: str = MANTIS_CHECKPOINT,
+                   mantis_batch_size: int = BATCHSIZE,
+                   results_dir: str = DEFAULT_RESULTS_DIR):
     """
     批量读取 UCR 路径下所有数据集并评测。
     ucr_root: UCRArchive_2018 路径（如 /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/data/UCRArchive_2018）
@@ -420,12 +434,12 @@ def batch_test_ucr(ucr_root, use_mantis: bool = True):
     clf_kwargs = dict(
         verbose=False,
         checkpoint_version="tabicl-classifier-v1.1-0506.ckpt",
-        model_path=TABICL_CHECKPOINT,
+        model_path=tabicl_ckpt,
     )
     if use_mantis:
         clf_kwargs.update(
-            mantis_checkpoint=MANTIS_CHECKPOINT,
-            mantis_batch_size=BATCHSIZE,
+            mantis_checkpoint=mantis_ckpt,
+            mantis_batch_size=mantis_batch_size,
         )
 
     clf = TabICLClassifier(**clf_kwargs)
@@ -448,12 +462,12 @@ def batch_test_ucr(ucr_root, use_mantis: bool = True):
     if results:
         avg_acc = sum(acc for _, acc in results) / len(results)
         print(f"\n共评测 {len(results)} 个数据集，平均准确率: {avg_acc:.4f}")
-        results_dir = Path("evaluation_results")
-        results_dir.mkdir(exist_ok=True)
-        with open(results_dir / "ucr_batch_detailed.txt", "w") as f:
+        results_path = Path(results_dir)
+        results_path.mkdir(parents=True, exist_ok=True)
+        with open(results_path / "ucr_batch_detailed.txt", "w") as f:
             for dataset_name, accuracy in results:
                 f.write(f"{dataset_name}: {accuracy:.4f}\n")
-        with open(results_dir / "ucr_batch_summary.txt", "w") as f:
+        with open(results_path / "ucr_batch_summary.txt", "w") as f:
             f.write(f"Total datasets: {len(results)}\n")
             f.write(f"Average accuracy: {avg_acc:.4f}\n")
     else:
@@ -474,17 +488,64 @@ def _parse_args():
         default=DEFAULT_UCR_PATH,
         help=f"UCR dataset root directory (default: {DEFAULT_UCR_PATH})",
     )
+    parser.add_argument(
+        "--tabicl-ckpt",
+        default=TABICL_CHECKPOINT,
+        help="Path to TabICL checkpoint file",
+    )
+    parser.add_argument(
+        "--mantis-ckpt",
+        default=MANTIS_CHECKPOINT,
+        help="Path to Mantis checkpoint file (used when --use-mantis is enabled)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=BATCHSIZE,
+        help="Mini-batch size for Mantis encoding",
+    )
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=MAXWORKERS,
+        help="Maximum number of worker processes for dataset evaluation",
+    )
+    parser.add_argument(
+        "--results-dir",
+        default=DEFAULT_RESULTS_DIR,
+        help="Directory to store evaluation outputs",
+    )
+    parser.add_argument(
+        "--use-mantis",
+        dest="use_mantis",
+        action="store_true",
+        help="Enable Mantis encoder for TabICL",
+    )
+    parser.add_argument(
+        "--no-mantis",
+        dest="use_mantis",
+        action="store_false",
+        help="Disable Mantis encoder",
+    )
+    parser.set_defaults(use_mantis=WORKER_USE_MANTIS)
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
+    batch_size = max(1, args.batch_size)
+    max_workers = max(1, args.max_workers)
+
     evaluator = UCR_UEAEvaluator(
         UEA_data_path=args.uea_path,
         UCR_data_path=args.ucr_path,
-        mantis_batch_size=BATCHSIZE,
-        use_mantis=WORKER_USE_MANTIS,
+        mantis_batch_size=batch_size,
+        use_mantis=args.use_mantis,
         log_processing=True,
+        tabicl_ckpt=args.tabicl_ckpt,
+        mantis_ckpt=args.mantis_ckpt,
+        results_dir=args.results_dir,
+        max_workers=max_workers,
     )
     # target_datasets = [
     #     "BasicMotions",
@@ -504,7 +565,7 @@ if __name__ == "__main__":
 
     if USE_PARALLEL_EVAL:
         print("\n===== Evaluating ALL UEA datasets with multiprocessing / multi-GPU =====")
-        parallel_results = evaluate_datasets_parallel(dataset_names, evaluator._worker_config, max_workers=MAXWORKERS)
+        parallel_results = evaluate_datasets_parallel(dataset_names, evaluator._worker_config, max_workers=max_workers)
         for name, acc in parallel_results:
             print(f"{name} accuracy: {acc:.4f}")
             all_uea_results.append((name, float(acc)))
@@ -524,8 +585,7 @@ if __name__ == "__main__":
                 evaluator.results.append((name, acc_val))
 
     # 2) 计算所有 UEA 数据集的平均准确率并保存
-    results_dir = Path("evaluation_results")
-    results_dir.mkdir(exist_ok=True)
+    results_dir = evaluator.results_dir
     if all_uea_results:
         avg_acc = sum(v for _, v in all_uea_results) / len(all_uea_results)
         print(f"\nAll UEA datasets evaluated: {len(all_uea_results)}, average accuracy: {avg_acc:.4f}")
