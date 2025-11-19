@@ -11,17 +11,9 @@ provide lazy accessors for heavier sklearn-based classes.
 # and do not import `tabicl` back.
 from .model.inference_config import InferenceConfig
 from .model.tabicl import TabICL
-from .model.mantisICL import MantisICL
-from .model.mantis_tabicl import MantisTabICL
+from .model.mantisICL512 import MantisICL
 
-__all__ = [
-	"InferenceConfig",
-	"TabICL",
-	"MantisICL",
-	"MantisTabICL",
-	"TabICLClassifier",
-	"MantisICLClassifier",
-]
+__all__ = ["InferenceConfig", "TabICL", "MantisICL", "TabICLClassifier", "MantisICLClassifier"]
 
 
 def __getattr__(name: str):
