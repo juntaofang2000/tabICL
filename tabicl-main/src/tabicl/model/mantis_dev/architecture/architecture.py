@@ -8,7 +8,7 @@ from .tokgen_utils.convolution import Convolution
 from .tokgen_utils.encoders import MultiScaledScalarEncoder, LinearEncoder
 from .vit_utils.positional_encoding import PositionalEncoding
 from .vit_utils.transformer import Transformer
-
+from ..Flayers.Fredformer_backbone import Fredformer_backbone
 
 # ==================================
 # ====       Organization:      ====
@@ -16,7 +16,84 @@ from .vit_utils.transformer import Transformer
 # ==== class TokenGeneratorUnit ====
 # ==== class ViTUnit            ====
 # ==== class Mantis8M           ====
+# ==== class FDDM_Plugin        ====
+# ==== class Mantis8MWithFDDM   ====
 # ==================================
+
+
+class FDDM_Plugin(nn.Module):
+    """Wraps the Fredformer backbone so it can serve as the plug-in branch."""
+
+    def __init__(
+        self,
+        seq_len,
+        num_channels,
+        # block_size=8,
+        output_feature_dim=256,
+        channel_first=False,
+        fredformer_config=None,
+    ):
+        super().__init__()
+        self.seq_len = seq_len
+        self.num_channels = num_channels
+        self.channel_first = channel_first
+
+        default_cfg = dict(
+            ablation=0,
+            mlp_drop=0.1,
+            use_nys=0,
+            output=0,
+            cf_dim=512,
+            cf_depth=6,
+            cf_heads=8,
+            cf_mlp=512,   # 512 -> 256
+            cf_head_dim=32,
+            cf_drop=0.1,
+            patch_len=48,
+            stride=48,
+            d_model=512,
+            head_dropout=0.1,
+            padding_patch='end',
+            individual=False,
+            revin=True,
+            affine=False,
+            subtract_last=False,
+            target_window=256,
+        )
+        if fredformer_config:
+            default_cfg.update(fredformer_config)
+
+        target_window = default_cfg.pop("target_window", seq_len)
+        self.target_window = target_window
+        self.fredformer = Fredformer_backbone(
+            c_in=self.num_channels,
+            context_window=self.seq_len,
+            target_window=target_window,
+            **default_cfg,
+        )
+        flattened_dim = self.num_channels * self.target_window
+        self.feature_norm = nn.LayerNorm(flattened_dim)
+        # self.final_projection = nn.Linear(flattened_dim, output_feature_dim)
+
+    def forward(self, x):
+        if x.ndim != 3:
+            raise ValueError("Expected tensor of shape (B, C, L) or (B, L, C) for FDDM_Plugin")
+
+        if self.channel_first:
+            if x.shape[1] != self.num_channels or x.shape[2] != self.seq_len:
+                raise ValueError("channel_first input must be shaped (B, num_channels, seq_len)")
+            plugin_input = x
+        else:
+            if x.shape[1] != self.seq_len or x.shape[2] != self.num_channels:
+                raise ValueError("channel_last input must be shaped (B, seq_len, num_channels)")
+            plugin_input = x.transpose(1, 2).contiguous()
+
+        freq_features = self.fredformer(plugin_input.contiguous())
+        batch = freq_features.shape[0]
+        freq_features = freq_features.reshape(batch, -1)
+        freq_features = self.feature_norm(freq_features)
+        # return self.final_projection(freq_features)
+        return freq_features
 
 
 class TokenGeneratorUnit(nn.Module):
@@ -221,3 +298,83 @@ class Mantis8M(
         else:
             # 如果不是预训练阶段，则直接返回vit的输出
             return vit_out
+
+
+class Mantis8MWithFDDM(
+    nn.Module,
+    PyTorchModelHubMixin,
+    library_name="mantis",
+    repo_url="https://huggingface.co/paris-noah/Mantis-8M/tree/main",
+    pipeline_tag="time-series-foundation-model",
+    license="mit",
+    tags=["time-series-foundation-model"],
+):
+    """Composite model that fuses Mantis8M embeddings with FDDM frequency cues."""
+
+    def __init__(
+        self,
+        seq_len=512,
+        hidden_dim=256,
+        num_patches=32,
+        num_channels=1,
+        scalar_scales=None,
+        hidden_dim_scalar_enc=32,
+        epsilon_scalar_enc=1.1,
+        transf_depth=6,
+        transf_num_heads=8,
+        transf_mlp_dim=512,
+        transf_dim_head=128,
+        transf_dropout=0.1,
+        fddm_output_dim=256,
+        device='cuda',
+        pre_training=False,
+    ):
+        super().__init__()
+        self.seq_len = seq_len
+        self.num_channels = num_channels
+        self.hidden_dim = hidden_dim
+        self.pre_training = pre_training
+
+        self.mantis = Mantis8M(
+            seq_len=seq_len,
+            hidden_dim=hidden_dim,
+            num_patches=num_patches,
+            scalar_scales=scalar_scales,
+            hidden_dim_scalar_enc=hidden_dim_scalar_enc,
+            epsilon_scalar_enc=epsilon_scalar_enc,
+            transf_depth=transf_depth,
+            transf_num_heads=transf_num_heads,
+            transf_mlp_dim=transf_mlp_dim,
+            transf_dim_head=transf_dim_head,
+            transf_dropout=transf_dropout,
+            device=device,
+            pre_training=pre_training,
+        )
+
+        self.fddm_plugin = FDDM_Plugin(
+            seq_len=seq_len,
+            num_channels=num_channels,
+            output_feature_dim=fddm_output_dim,
+            channel_first=True,
+        )
+
+        #self.fusion_input_dim = self.mantis.hidden_dim + fddm_output_dim
+        #self.output_dim = fusion_dim if fusion_dim is not None else self.fusion_input_dim
+        # self.fusion_head = nn.Sequential(
+        #     nn.LayerNorm(self.fusion_input_dim),
+        #     nn.Dropout(fusion_dropout),
+        #     nn.Linear(self.fusion_input_dim, self.output_dim),
+        # )
+        print("注意本次模型forward 只有mantis_features,没有contact-----------------------------------")
+        self.to(device)
+
+    def to(self, device):
+        self.device = device
+        return super().to(device)
+
+    def forward(self, x):
+        mantis_features = self.mantis(x)
+        freq_features = self.fddm_plugin(x)
+        #fused = torch.cat([mantis_features, freq_features], dim=-1)
+        # return self.fusion_head(fused)
+        return freq_features

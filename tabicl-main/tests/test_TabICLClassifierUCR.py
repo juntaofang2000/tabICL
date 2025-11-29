@@ -9,18 +9,21 @@ import pandas as pd
 import os
 import multiprocessing as mp
 from tabicl.prior.data_reader import DataReader
+import torch.nn.functional as F
 
 MANTIS_CHECKPOINT ="/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/checkpoint/CaukerMixed-data100k_200_2e-3_100epochs.pt"
 TABICL_CHECKPOINT = "/data0/fangjuntao2025/tabicl-main/tabICLOrignCheckpoint/tabicl-classifier-v1.1-0506.ckpt"
 DEFAULT_UEA_PATH = "/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UEAData/"
 DEFAULT_UCR_PATH = "/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UCRdata/"
 DEFAULT_RESULTS_DIR = "evaluation_results"
-BATCHSIZE =   32
+BATCHSIZE =   64
 MAXWORKERS = 3
-WORKER_USE_MANTIS = False
+WORKER_USE_MANTIS = True
 # Module-level worker helpers for multiprocessing (must be picklable / top-level)
 WORKER_READER = None
 WORKER_CLF = None
+DEFAULT_NORM_METHODS = ["none", "robust"]
+_NORM_SENTINEL = object()
 
 USE_PARALLEL_EVAL = os.environ.get("TABICL_USE_MULTIGPU", "1") == "1"
 # USE_PARALLEL_EVAL = 0
@@ -63,7 +66,7 @@ def _prepare_feature_array(array: np.ndarray) -> np.ndarray:
     # otherwise flatten all trailing axes into feature dimension
     return array.reshape(array.shape[0], -1)
 
-def _worker_init(uea_path, ucr_path, use_mantis, mantis_batch_size, tabicl_ckpt, mantis_ckpt, transform_ts_size):
+def _worker_init(uea_path, ucr_path, use_mantis, mantis_batch_size, tabicl_ckpt, mantis_ckpt, transform_ts_size, norm_methods):
     """Initializer run once per worker process to create heavy objects and bind a GPU."""
     global WORKER_READER, WORKER_CLF, WORKER_USE_MANTIS
 
@@ -89,6 +92,8 @@ def _worker_init(uea_path, ucr_path, use_mantis, mantis_batch_size, tabicl_ckpt,
         checkpoint_version="tabicl-classifier-v1.1-0506.ckpt",
         model_path=tabicl_ckpt,
     )
+    if norm_methods is not None:
+        clf_kwargs["norm_methods"] = norm_methods
     if use_mantis:
         clf_kwargs.update(mantis_checkpoint=mantis_ckpt, mantis_batch_size=mantis_batch_size)
     WORKER_CLF = TabICLClassifier(**clf_kwargs)
@@ -139,6 +144,7 @@ def evaluate_datasets_parallel(dataset_names, worker_config, max_workers=MAXWORK
         worker_config['tabicl_ckpt'],
         worker_config['mantis_ckpt'],
         worker_config['transform_ts_size'],
+        worker_config['norm_methods'],
     )
 
     with ctx.Pool(processes=requested, initializer=_worker_init, initargs=initargs) as pool:
@@ -150,7 +156,16 @@ def evaluate_datasets_parallel(dataset_names, worker_config, max_workers=MAXWORK
 
     return sorted(results)
 
-
+def load_dataset_names_from_file(filepath):
+    """从结果文件读取所有数据集名称（每行格式：name: acc）"""
+    names = []
+    with open(filepath, "r") as f:
+        for line in f:
+            if ":" in line:
+                name = line.split(":")[0].strip()
+                if name:
+                    names.append(name)
+    return names
 
 class UCR_UEAEvaluator:
     def __init__(self,
@@ -162,7 +177,8 @@ class UCR_UEAEvaluator:
                  tabicl_ckpt: str = TABICL_CHECKPOINT,
                  mantis_ckpt: str = MANTIS_CHECKPOINT,
                  results_dir: str = DEFAULT_RESULTS_DIR,
-                 max_workers: int = MAXWORKERS):
+                 max_workers: int = MAXWORKERS,
+                 norm_methods=_NORM_SENTINEL):
         """
         初始化评估器。
 
@@ -195,6 +211,10 @@ class UCR_UEAEvaluator:
         self.results_dir = Path(results_dir)
         self.results_dir.mkdir(parents=True, exist_ok=True)
         self.max_workers = max(1, max_workers)
+        if norm_methods is _NORM_SENTINEL:
+            self.norm_methods = DEFAULT_NORM_METHODS.copy()
+        else:
+            self.norm_methods = norm_methods
 
         # Instantiate classifier once to avoid re-loading the heavy checkpoint repeatedly.
         classifier_kwargs = dict(
@@ -203,6 +223,8 @@ class UCR_UEAEvaluator:
             checkpoint_version="tabicl-classifier-v1.1-0506.ckpt",
             model_path=self.tabicl_ckpt,
         )
+        if self.norm_methods is not None:
+            classifier_kwargs["norm_methods"] = self.norm_methods
         if self.use_mantis:
             classifier_kwargs.update(
                 mantis_checkpoint=self.mantis_ckpt,
@@ -221,6 +243,7 @@ class UCR_UEAEvaluator:
             tabicl_ckpt=self.tabicl_ckpt,
             mantis_ckpt=self.mantis_ckpt,
             transform_ts_size=512,
+            norm_methods=self.norm_methods,
         )
 
     def evaluate_dataset(self, dataset_name: str) -> float:
@@ -247,8 +270,28 @@ class UCR_UEAEvaluator:
                 X_train = _prepare_feature_array(X_train)
                 X_test = _prepare_feature_array(X_test)
 
-            dataset_stats = self._collect_stats(dataset_name, X_train, X_test)
-            self.stats.append(dataset_stats)
+
+
+            # # 预处理
+            # if self.use_mantis:  # 处理为单通道
+            #     X_train = _prepare_feature_array(X_train)  # 处理为单通道
+            #     X_test = _prepare_feature_array(X_test)
+            #     X_train =  torch.tensor(X_train, dtype=torch.float).unsqueeze(1)
+            #     X_test =  torch.tensor(X_test, dtype=torch.float).unsqueeze(1)
+            #     X_train  = F.interpolate(X_train, size=512, mode='linear', align_corners=False).numpy()
+            #     X_test  = F.interpolate(X_test, size=512, mode='linear', align_corners=False).numpy()   
+            
+
+            # 预处理
+            if self.use_mantis:  
+                print(f"Using Mantis pre-encoding: 输入[N, C, L] :{X_train.shape}")
+
+
+
+
+
+            # dataset_stats = self._collect_stats(dataset_name, X_train, X_test)
+            # self.stats.append(dataset_stats)
 
             # 初始化并训练分类器
             # reuse pre-instantiated classifier to avoid heavyweight reloads
@@ -314,6 +357,7 @@ class UCR_UEAEvaluator:
             self._worker_config['tabicl_ckpt'],
             self._worker_config['mantis_ckpt'],
             self._worker_config['transform_ts_size'],
+            self._worker_config['norm_methods'],
         )) as pool:
             # Evaluate UCR
             # ucr_list = sorted(self.reader.dataset_list_ucr)
@@ -424,7 +468,8 @@ def batch_test_ucr(ucr_root,
                    tabicl_ckpt: str = TABICL_CHECKPOINT,
                    mantis_ckpt: str = MANTIS_CHECKPOINT,
                    mantis_batch_size: int = BATCHSIZE,
-                   results_dir: str = DEFAULT_RESULTS_DIR):
+                   results_dir: str = DEFAULT_RESULTS_DIR,
+                   norm_methods=_NORM_SENTINEL):
     """
     批量读取 UCR 路径下所有数据集并评测。
     ucr_root: UCRArchive_2018 路径（如 /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/data/UCRArchive_2018）
@@ -436,6 +481,10 @@ def batch_test_ucr(ucr_root,
         checkpoint_version="tabicl-classifier-v1.1-0506.ckpt",
         model_path=tabicl_ckpt,
     )
+    if norm_methods is _NORM_SENTINEL:
+        norm_methods = DEFAULT_NORM_METHODS.copy()
+    if norm_methods is not None:
+        clf_kwargs["norm_methods"] = norm_methods
     if use_mantis:
         clf_kwargs.update(
             mantis_checkpoint=mantis_ckpt,
@@ -525,9 +574,21 @@ def _parse_args():
         "--no-mantis",
         dest="use_mantis",
         action="store_false",
-        help="Disable Mantis encoder",
+        help="Disable Mantis encoder and fall back to flattened inputs",
     )
-    parser.set_defaults(use_mantis=WORKER_USE_MANTIS)
+    parser.add_argument(
+        "--robust-norm",
+        dest="robust_norm",
+        action="store_true",
+        help='Use norm_methods=["none","robust"] inside TabICLClassifier (default).',
+    )
+    parser.add_argument(
+        "--default-norm",
+        dest="robust_norm",
+        action="store_false",
+        help="Fallback to TabICL's built-in normalization pipeline (includes power transform).",
+    )
+    parser.set_defaults(use_mantis=WORKER_USE_MANTIS, robust_norm=True)
     return parser.parse_args()
 
 
@@ -535,6 +596,7 @@ if __name__ == "__main__":
     args = _parse_args()
     batch_size = max(1, args.batch_size)
     max_workers = max(1, args.max_workers)
+    norm_methods = DEFAULT_NORM_METHODS.copy() if args.robust_norm else None
 
     evaluator = UCR_UEAEvaluator(
         UEA_data_path=args.uea_path,
@@ -546,6 +608,7 @@ if __name__ == "__main__":
         mantis_ckpt=args.mantis_ckpt,
         results_dir=args.results_dir,
         max_workers=max_workers,
+        norm_methods=norm_methods,
     )
     # target_datasets = [
     #     "BasicMotions",
@@ -561,6 +624,8 @@ if __name__ == "__main__":
     #     name for name in sorted(evaluator.reader.dataset_list_uea)
     #     if name not in SKIP_UEA_DATASETS
     # ]
+    # selected_file = "./evaluation_results/MantisOnce_TabICL_uea_all_detailed1119_2141.txt"
+    # dataset_names = load_dataset_names_from_file(selected_file)
     all_uea_results = []
 
     if USE_PARALLEL_EVAL:
@@ -573,6 +638,7 @@ if __name__ == "__main__":
     else:
         print("\n===== Evaluating ALL UEA datasets (single-process) =====")
         for name in dataset_names:
+            # name = 'AtrialFibrillation'
             print(f"\n----- Evaluating {name} -----")
             acc = evaluator.evaluate_dataset(name)
             print(f"{name} accuracy: {acc:.4f}")
@@ -590,11 +656,11 @@ if __name__ == "__main__":
         avg_acc = sum(v for _, v in all_uea_results) / len(all_uea_results)
         print(f"\nAll UEA datasets evaluated: {len(all_uea_results)}, average accuracy: {avg_acc:.4f}")
 
-        with open(results_dir / "TabICL_uea_all_detailed.txt", "w") as f:
+        with open(results_dir / "MantisOnceProcessTabICL_uea_all_detailed30.txt", "w") as f:
             for name, val in all_uea_results:
                 f.write(f"{name}: {val:.6f}\n")
 
-        with open(results_dir / "TabICL_uea_all_summary.txt", "w") as f:
+        with open(results_dir / "MantisOnceProcess_uea_all_summary30.txt", "w") as f:
             f.write(f"Total datasets: {len(all_uea_results)}\n")
             f.write(f"Average accuracy: {avg_acc:.6f}\n")
     else:

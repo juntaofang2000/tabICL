@@ -105,9 +105,36 @@ def encode_with_mantis(
     #     reps =  model.transform(batch,to_numpy=True) # mantis_model(batch)
     #     # outputs.append(reps.cpu())
     #     outputs.append(reps)
+    print("mantis 多通道时序 各个通道单独提取")
     z  =   model.transform(tensor,batch_size,to_numpy=True)
     
     return z
+
+
+# @torch.no_grad()
+# def encode_with_mantis(
+#     mantis_model: Mantis8M,
+#     X: np.ndarray,
+#     device: torch.device,
+#     batch_size: int = 16,
+# ) -> np.ndarray:
+#     """Encode a matrix (n_samples, seq_len) using the provided Mantis encoder."""
+
+#     if X.ndim not in (2, 3):
+#         raise ValueError(f"Mantis encoder expects a 2D or 3D array, got shape {X.shape}")
+
+#     tensor = torch.from_numpy(np.asarray(X, dtype=np.float32)).to(device)
+#     if tensor.ndim == 2:
+#         tensor = tensor.unsqueeze(1)
+
+#     embeddings = []
+#     for start in range(0, tensor.size(0), batch_size):
+#         end = start + batch_size
+#         batch = tensor[start:end]
+#         reps = mantis_model(batch)
+#         embeddings.append(reps.detach().cpu())
+
+#     return torch.cat(embeddings, dim=0).numpy()
 
 
 class MantisTabICL(nn.Module):

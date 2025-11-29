@@ -539,6 +539,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         X = np.asarray(X, dtype=np.float32)
         if self.mantis_checkpoint is not None:
             X = self._mantis_encode(X)
+            print("/data0/fangjuntao2025/tabicl-main/src/tabicl/sklearn/classifier.py")
 
         # Fit ensemble generator to create multiple dataset views
         self.ensemble_generator_ = EnsembleGenerator(
