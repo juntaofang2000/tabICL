@@ -8,7 +8,8 @@ import os
 from tabicl.prior.data_reader import DataReader
 
 class UCREvaluator:
-    def __init__(self, data_path: str):
+    def __init__(self,                  UEA_data_path: str = "/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UEAData/",
+                 UCR_data_path: str = "/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UCRdata/"):
         """
         初始化评估器。
 
@@ -17,7 +18,11 @@ class UCREvaluator:
         data_path : str
             UCR 数据集的路径。
         """
-        self.reader = DataReader(data_path=data_path)
+        self.reader = DataReader(
+            UEA_data_path=UEA_data_path,
+            UCR_data_path=UCR_data_path,
+            transform_ts_size=512
+        )
         self.results = []
         # 初始化一次 MantisICLClassifier 并在多个数据集上复用，避免重复加载 checkpoint
         self.clf = MantisICLClassifier(
@@ -171,7 +176,8 @@ def batch_test_ucr(ucr_root):
 if __name__ == "__main__":
     # 1. 原有 DataReader 方式评估所有 UCR 数据集
     data_path = "/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/data/"
-    evaluator = UCREvaluator(data_path)
+    evaluator = UCREvaluator(  UEA_data_path="/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UEAData/",
+        UCR_data_path= "/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UCRdata/",)
     evaluator.evaluate_all()
 
     # 2. 新增：批量读取 UCRArchive_2018 下所有数据集并评测 （不改变原始时序长度）
