@@ -156,9 +156,23 @@ def build_parser():
         help="If True, occasionally sample smaller sequence lengths to ensure model robustness on smaller datasets",
     )
     parser.add_argument(
-        "--prior_type", default="mix_scm", type=str, help="Prior type: dummy, mlp_scm, tree_scm, mix_scm, real"
+        "--prior_type",
+        default="mix_scm",
+        type=str,
+        help="Prior type: dummy, mlp_scm, tree_scm, mix_scm, real, mixup",
     )
     parser.add_argument("--prior_device", default="cpu", type=str, help="Device for prior data generation")
+    parser.add_argument(
+        "--mixup_config",
+        type=str,
+        default=None,
+        help="Optional JSON file overriding MultiClassMixupDataset settings when prior_type=mixup",
+    )
+    parser.add_argument("--mixup_n_bit", type=int, default=8, help="Default n_bit for mixup prior")
+    parser.add_argument("--mixup_n_step", type=int, default=120, help="Default n_step for mixup prior")
+    parser.add_argument("--mixup_max_class", type=int, default=5, help="Default max_class for mixup prior")
+    parser.add_argument("--mixup_alpha", type=float, default=1.0, help="Dirichlet alpha for mixup prior")
+    parser.add_argument("--mixup_augment_cap", type=int, default=2, help="Augmentation count cap for mixup prior")
 
     ###########################################################################
     ##### Model Architecture Config ###########################################
@@ -177,7 +191,7 @@ def build_parser():
     )
     parser.add_argument(
         "--train_mantis",
-        default=False,
+        default=True,
         type=str2bool,
         help="If True, train the mantis",
     )

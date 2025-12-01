@@ -195,7 +195,7 @@ class ColEmbedding(nn.Module):
             embeddings[mask] = effective_embeddings  # Fill in the computed embeddings
 
         return embeddings.transpose(1, 2)  # (B, T, H+C, E)
-
+ 
     def _inference_forward(
         self,
         X: Tensor,

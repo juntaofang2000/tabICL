@@ -11,13 +11,15 @@ import multiprocessing as mp
 from tabicl.prior.data_reader import DataReader
 import torch.nn.functional as F
 
-MANTIS_CHECKPOINT ="/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/checkpoint/CaukerMixed-data100k_200_2e-3_100epochs.pt"
-TABICL_CHECKPOINT = "/data0/fangjuntao2025/tabicl-main/tabICLOrignCheckpoint/tabicl-classifier-v1.1-0506.ckpt"
+#MANTIS_CHECKPOINT ="/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/checkpoint/CaukerMixed-data100k_200_2e-3_100epochs.pt"
+MANTIS_CHECKPOINT = "/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint/"
+#TABICL_CHECKPOINT = "/data0/fangjuntao2025/tabicl-main/tabICLOrignCheckpoint/tabicl-classifier-v1.1-0506.ckpt"
+TABICL_CHECKPOINT = "/data0/fangjuntao2025/tabicl-main/ft_checkpoints/mantis_tabicl_ft_epoch1.ckpt"
 DEFAULT_UEA_PATH = "/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UEAData/"
 DEFAULT_UCR_PATH = "/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UCRdata/"
 DEFAULT_RESULTS_DIR = "evaluation_results"
-BATCHSIZE =   64
-MAXWORKERS = 3
+BATCHSIZE =   128
+MAXWORKERS = 1
 WORKER_USE_MANTIS = True
 # Module-level worker helpers for multiprocessing (must be picklable / top-level)
 WORKER_READER = None
@@ -25,8 +27,8 @@ WORKER_CLF = None
 DEFAULT_NORM_METHODS = ["none", "robust"]
 _NORM_SENTINEL = object()
 
-USE_PARALLEL_EVAL = os.environ.get("TABICL_USE_MULTIGPU", "1") == "1"
-# USE_PARALLEL_EVAL = 0
+#USE_PARALLEL_EVAL = os.environ.get("TABICL_USE_MULTIGPU", "1") == "1"
+USE_PARALLEL_EVAL = 0
 
 SKIP_UEA_DATASETS = {
     "AtrialFibrillation",
@@ -98,7 +100,11 @@ def _worker_init(uea_path, ucr_path, use_mantis, mantis_batch_size, tabicl_ckpt,
         clf_kwargs.update(mantis_checkpoint=mantis_ckpt, mantis_batch_size=mantis_batch_size)
     WORKER_CLF = TabICLClassifier(**clf_kwargs)
 
-
+def _select_first_channel(array: np.ndarray) -> np.ndarray:
+    """Keep only the first channel when arrays are multi-channel."""
+    if array.ndim >= 3:
+        return array[:, 0, ...]
+    return array
 def _worker_eval(dataset_name):
     """Evaluate a single dataset inside a worker process; returns (name, acc, err)."""
     global WORKER_READER, WORKER_CLF, WORKER_USE_MANTIS
@@ -269,6 +275,11 @@ class UCR_UEAEvaluator:
             if not self.use_mantis:
                 X_train = _prepare_feature_array(X_train)
                 X_test = _prepare_feature_array(X_test)
+                # X_train =  torch.tensor(X_train, dtype=torch.float).unsqueeze(1)
+                # X_test =  torch.tensor(X_test, dtype=torch.float).unsqueeze(1)
+                # X_train  = F.interpolate(X_train, size=512, mode='linear', align_corners=False).squeeze(1).numpy()
+                # X_test  = F.interpolate(X_test, size=512, mode='linear', align_corners=False).squeeze(1).numpy()   
+            
 
 
 
@@ -619,13 +630,13 @@ if __name__ == "__main__":
     #     "PEMS-SF",
     # ]
     # 1) 遍历所有 UEA 数据集，逐个评测并记录结果
-    dataset_names = sorted(evaluator.reader.dataset_list_uea)
+    dataset_names = sorted(evaluator.reader.dataset_list_ucr)
     # dataset_names = [
     #     name for name in sorted(evaluator.reader.dataset_list_uea)
     #     if name not in SKIP_UEA_DATASETS
     # ]
-    # selected_file = "./evaluation_results/MantisOnce_TabICL_uea_all_detailed1119_2141.txt"
-    # dataset_names = load_dataset_names_from_file(selected_file)
+    #selected_file = "./evaluation_results/mantisTabICL_uea_all_detailed.txt"
+    #dataset_names = load_dataset_names_from_file(selected_file)
     all_uea_results = []
 
     if USE_PARALLEL_EVAL:
@@ -656,11 +667,11 @@ if __name__ == "__main__":
         avg_acc = sum(v for _, v in all_uea_results) / len(all_uea_results)
         print(f"\nAll UEA datasets evaluated: {len(all_uea_results)}, average accuracy: {avg_acc:.4f}")
 
-        with open(results_dir / "MantisOnceProcessTabICL_uea_all_detailed30.txt", "w") as f:
+        with open(results_dir / "MantisTabICLFinetune_ucr_all_detailed20251209.txt", "w") as f:
             for name, val in all_uea_results:
                 f.write(f"{name}: {val:.6f}\n")
 
-        with open(results_dir / "MantisOnceProcess_uea_all_summary30.txt", "w") as f:
+        with open(results_dir / "MantisTabICLFinetune_ucr_all_summary20251209.txt", "w") as f:
             f.write(f"Total datasets: {len(all_uea_results)}\n")
             f.write(f"Average accuracy: {avg_acc:.6f}\n")
     else:

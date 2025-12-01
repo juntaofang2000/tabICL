@@ -23,6 +23,7 @@ import wandb
 
 from tabicl import TabICL
 from tabicl.prior.dataset import PriorDataset
+from tabicl.prior.mixup_dataset import MixupPriorDataset, load_mixup_config
 from tabicl.prior.genload import LoadPriorDataset
 from tabicl.train.optim import get_scheduler
 from tabicl.train.train_config import build_parser
@@ -91,8 +92,18 @@ class Trainer:
 
     def __init__(self, config):
         self.config = config
+        if self.config.checkpoint_dir is None:
+            self.config.checkpoint_dir = "checkpoints"
         self.configure_ddp()
         self.configure_wandb()
+
+        if self.master_process:
+            print("=" * 40)
+            print("Training Configuration:")
+            for key, value in sorted(vars(self.config).items()):
+                print(f"{key}: {value}")
+            print("=" * 40)
+
         self.build_model()
         self.configure_prior()
         self.configure_optimizer()
@@ -170,6 +181,7 @@ class Trainer:
                 mode=self.config.wandb_mode,
             )
 
+            os.makedirs(self.config.checkpoint_dir, exist_ok=True)
             with open(id_path, "w") as f:
                 f.write(self.wandb_run.id)
         else:
@@ -233,7 +245,20 @@ class Trainer:
         during training with controllable properties and data distributions.
         """
 
-        if self.config.prior_dir is None:
+        if self.config.prior_type == "mixup":
+            mixup_config = {
+                "n_bit": self.config.mixup_n_bit,
+                "n_step": self.config.mixup_n_step,
+                "max_class": self.config.mixup_max_class,
+                "mix_alpha": self.config.mixup_alpha,
+                "augment_cap": self.config.mixup_augment_cap,
+            }
+            mixup_config.update(load_mixup_config(self.config.mixup_config))
+            dataset = MixupPriorDataset(
+                batch_size=self.config.batch_size,
+                mixup_config=mixup_config,
+            )
+        elif self.config.prior_dir is None:
             # Generate prior data on the fly
             dataset = PriorDataset(
                 real_data_dir=self.config.real_data_dir,
