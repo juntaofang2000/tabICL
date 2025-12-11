@@ -11,7 +11,7 @@ from tabicl.prior.data_reader import DataReader
 
 
 DEFAULT_CHECKPOINT = (
-    "/data0/fangjuntao2025/tabicl-main/src/tabicl/checkpointsMantisICL12blocks/step-42300.ckpt"
+    "/data0/fangjuntao2025/tabicl-main/src/tabicl/checkpointsMantisICL/mixup_run_v1/step-2650.ckpt"
 )
 DEFAULT_UEA_PATH = "/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UEAData/"
 DEFAULT_UCR_PATH = "/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UCRdata/"
@@ -161,13 +161,15 @@ def main() -> None:
     if args.max_ucr is not None:
         ucr_names = ucr_names[: args.max_ucr]
 
+    print("\n===== Evaluating UCR datasets =====")
+    ucr_results = evaluator.evaluate(ucr_names)
+    evaluator.summarize("UCR", ucr_results)
+
     print("\n===== Evaluating UEA datasets =====")
     uea_results = evaluator.evaluate(uea_names)
     evaluator.summarize("UEA", uea_results)
 
-    print("\n===== Evaluating UCR datasets =====")
-    ucr_results = evaluator.evaluate(ucr_names)
-    evaluator.summarize("UCR", ucr_results)
+
 
 
 if __name__ == "__main__":

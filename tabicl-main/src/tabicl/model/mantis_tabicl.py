@@ -88,7 +88,7 @@ def build_mantis_encoder(
         )
 
     mantis_model.to(device)
-    mantis_model.eval()
+    # mantis_model.eval()
     return mantis_model
 
 
@@ -182,45 +182,90 @@ class MantisTabICL(nn.Module):
             seq_len=512,
         )
 
-        self.tabicl_model.eval()
-        self.mantis_model.eval()
+        # self.tabicl_model.eval()
+        # self.mantis_model.eval()
 
     def _current_device(self) -> torch.device:
         return next(self.tabicl_model.parameters()).device
 
-    @torch.no_grad()
+
+    # def _encode_with_mantis(self, X: Tensor, device: Optional[torch.device] = None) -> Tensor:
+    #     """Run the Mantis encoder over flattened batches to obtain per-row embeddings."""
+        
+    #     if X.ndim != 3:
+    #         raise ValueError(f"Mantis encoder expects a 3D array, got shape {X.shape}")
+        
+    #     B, T, H = X.shape
+    #     device = device or next(self.mantis_model.parameters()).device
+        
+    #     # Ensure input is a tensor on the correct device
+    #     if not isinstance(X, torch.Tensor):
+    #         X = torch.from_numpy(np.asarray(X, dtype=np.float32))
+    #     X = X.to(device)
+
+    #     # Reshape to (B*T, 1, H) for Mantis processing
+    #     # Mantis expects (Batch, SeqLen, Channels) where SeqLen=1 for row-wise encoding
+    #     X_reshaped = X.reshape(-1, 1, H)
+        
+    #     # Process in batches to avoid OOM if necessary, but keep gradients
+    #     # If mantis_batch_size is large enough, we can process all at once
+    #     # For training, we usually rely on the outer loop (Trainer) to handle batching via micro-batches
+    #     # So we can process the whole micro-batch here.
+        
+    #     # However, if B*T is very large, we might still want to chunk it.
+    #     # But chunking with gradients requires gathering the results.
+        
+    #     representations_list = []
+    #     total_samples = X_reshaped.size(0)
+        
+    #     for start in range(0, total_samples, self.mantis_batch_size):
+    #         end = min(start + self.mantis_batch_size, total_samples)
+    #         batch = X_reshaped[start:end]
+    #         # Forward pass through Mantis
+    #         reps = self.mantis_model(batch)
+    #         representations_list.append(reps)
+            
+    #     # Concatenate results
+    #     representations = torch.cat(representations_list, dim=0)
+        
+    #     # Reshape back to (B, T, D)
+    #     return representations.reshape(B, T, -1)
+        
+    #     X_flat = tensor.reshape(-1, 1, H)
+    #     outputs = []
+    #     for i in range(0, X_flat.size(0), self.mantis_batch_size):
+    #         batch = X_flat[i : i + self.mantis_batch_size]
+    #         out = self.mantis_model(batch)
+    #         outputs.append(out)
+            
+    #     concatenated = torch.cat(outputs, dim=0)
+    #     return concatenated.reshape(B, T, -1)
+    
+    
     def _encode_with_mantis(self, X: Tensor, device: Optional[torch.device] = None) -> Tensor:
         """Run the Mantis encoder over flattened batches to obtain per-row embeddings."""
-        # B, T, H = X.shape
-        # X = X.reshape(-1, 1, H)
-        # representations: List[Tensor] = []
-        # device = device or next(self.mantis_model.parameters()).device
-
-        # for start in range(0, X.size(0), self.mantis_batch_size):
-        #     end = start + self.mantis_batch_size
-        #     batch = X[start:end].to(device)
-        #     reps = self.mantis_model(batch)
-        #     representations.append(reps)
-
-        # concatenated = torch.cat(representations, dim=0)
-        # return concatenated.reshape(B, T, -1)
         
         if X.ndim != 3:
             raise ValueError(f"Mantis encoder expects a 3D array, got shape {X.shape}")
-        B, T, H = X.shape
-        device = device or next(self.mantis_model.parameters()).device
-        if isinstance(X, torch.Tensor):
-            tensor = X.detach().to(device)
-        else:
-            tensor = torch.from_numpy(np.asarray(X, dtype=np.float32)).to(device)
-  
-        model = MantisTrainer(device=device, network=self.mantis_model)
-
-        print("mantis 多通道时序 各个通道单独提取")
-        z  =   model.transform(tensor,self.mantis_batch_size,to_numpy=True)
         
-        return z
-    
+        B, T, H = X.shape
+        # device = device or next(self.mantis_model.parameters()).device
+        
+        # Ensure input is a tensor on the correct device
+        if not isinstance(X, torch.Tensor):
+            X = torch.from_numpy(np.asarray(X, dtype=np.float32))
+        X = X.to(self.device)
+
+        # Reshape to (B*T, 1, H) for Mantis processing
+        # Mantis expects (Batch, SeqLen, Channels) where SeqLen=1 for row-wise encoding
+        X_reshaped = X.reshape(-1, 1, H)
+        
+        # Forward pass through Mantis
+        # We process all at once since micro-batching is handled externally in Trainer
+        reps = self.mantis_model(X_reshaped)
+        
+        # Reshape back to (B, T, D)
+        return reps.reshape(B, T, -1)    
     def forward(
         self,
         X: Tensor,
