@@ -5,6 +5,7 @@ import sys
 import json
 import torch
 import numpy as np
+import random
 from torch import nn, optim
 from torch.utils.data import DataLoader, TensorDataset
 from pathlib import Path
@@ -18,6 +19,28 @@ from tabicl.model.mantis_tabicl import MantisTabICL, build_mantis_encoder
 from tabicl.model.adapter import CALDA_Adapter, DistributionDiversityLoss
 from tabicl.prior.data_reader import DataReader
 from tabicl.model.tabicl import TabICL
+from tabicl.sklearn.classifier import TabICLClassifier
+
+def load_dataset_names_from_file(filepath):
+    """从结果文件读取所有数据集名称（每行格式：name: acc）"""
+    names = []
+    with open(filepath, "r") as f:
+        for line in f:
+            if ":" in line:
+                name = line.split(":")[0].strip()
+                if name:
+                    names.append(name)
+    return names
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 def _ensure_three_dim(array: np.ndarray) -> np.ndarray:
     arr = np.asarray(array, dtype=np.float32)
@@ -90,9 +113,14 @@ class MantisAdapterTabICL(nn.Module):
         mantis_outs = []
         total_samples = X_in.size(0)
         
+        # Get device from mantis model
+        device = next(self.mantis_model.parameters()).device
+        
         with torch.no_grad():
             for i in range(0, total_samples, self.mantis_batch_size):
                 batch = X_in[i : i + self.mantis_batch_size]
+                # Move batch to device
+                batch = batch.to(device)
                 out = self.mantis_model(batch)
                 mantis_outs.append(out)
             # Mantis output: (B*N*C, Mantis_Dim)
@@ -132,6 +160,53 @@ class MantisAdapterTabICL(nn.Module):
         
         return out, adapter_out
 
+def get_embeddings(model, X_data, device, batch_size=64):
+    """
+    Helper to get embeddings from Mantis + Adapter.
+    X_data: (N, C, L) tensor or numpy array
+    """
+    # Ensure X_data is tensor
+    if isinstance(X_data, np.ndarray):
+        X_data = torch.from_numpy(X_data).float()
+        
+    embs = []
+    N = X_data.size(0)
+    
+    model.eval()
+    with torch.no_grad():
+        for i in range(0, N, batch_size):
+            batch = X_data[i:i+batch_size].to(device)
+            # Mantis forward
+            # batch: (B, C, L) -> (B*C, 1, L)
+            B, C, L = batch.shape
+            batch_in = batch.reshape(-1, L).unsqueeze(1)
+            
+            # Mantis expects (Batch, Channels, SeqLen)
+            # We treat each channel as independent
+            
+            # Note: MantisAdapterTabICL.forward does batching internally for Mantis.
+            # But here we are already batching X_data.
+            # We can call model.mantis_model directly.
+            
+            # Process batch_in in smaller chunks for Mantis to avoid OOM
+            mantis_outs = []
+            sub_batch_size = 16 
+            for j in range(0, batch_in.size(0), sub_batch_size):
+                sub_batch = batch_in[j : j + sub_batch_size]
+                mantis_outs.append(model.mantis_model(sub_batch))
+            mantis_out = torch.cat(mantis_outs, dim=0) # (B*C, Mantis_Dim)
+            
+            # Adapter
+            mantis_out_reshaped = mantis_out.reshape(B, C, -1)
+            if model.adapter is not None:
+                adapter_out = model.adapter(mantis_out_reshaped) # (B, TabICL_Dim)
+            else:
+                adapter_out = mantis_out_reshaped.reshape(B, -1)
+                
+            embs.append(adapter_out.cpu().numpy())
+            
+    return np.concatenate(embs, axis=0)
+
 def train_one_dataset(args, dataset_name, model, reader, device):
     print(f"Processing {dataset_name}...")
     
@@ -148,25 +223,14 @@ def train_one_dataset(args, dataset_name, model, reader, device):
     X_test = _ensure_three_dim(X_test_raw)
     
     # Resize to 512 (Mantis default)
-    X_train = resize_series(X_train, target_len=512).to(device)
-    X_test = resize_series(X_test, target_len=512).to(device)
+    # Keep on CPU to avoid OOM
+    X_train = resize_series(X_train, target_len=512)
+    X_test = resize_series(X_test, target_len=512)
     
-    y_train = torch.from_numpy(y_train_raw).long().to(device)
-    y_test = torch.from_numpy(y_test_raw).long().to(device)
+    y_train = torch.from_numpy(y_train_raw).long()
+    y_test = torch.from_numpy(y_test_raw).long()
     
-    # 2. Prepare Data for In-Context Learning
-    # We treat the entire training set as the "Support Set" and we want to learn to adapt it.
-    # But TabICL is an ICL model. It takes (Support + Query).
-    # Here we are training the *Adapter*.
-    # Strategy:
-    # We can sample subsets from X_train as (Support, Query) to train the adapter.
-    # Or we can use X_train as Support and X_train (part of it) as Query?
-    # Standard ICL training: Sample a batch of tasks.
-    # Here we have one dataset. We can simulate tasks by subsampling.
-    
-    # Create a DataLoader that samples batches of (Support, Query) from X_train
-    # For simplicity, let's just randomly split X_train into Support/Query in each iteration.
-    
+    # 2. Train Adapter (Same as train_adapter.py)
     if model.adapter is not None:
         optimizer = optim.AdamW(model.adapter.parameters(), lr=args.lr, weight_decay=1e-4)
         div_loss_fn = DistributionDiversityLoss()
@@ -180,12 +244,8 @@ def train_one_dataset(args, dataset_name, model, reader, device):
             optimizer.zero_grad()
             
             # Sample a "task" from X_train
-            # Shuffle indices
             perm = torch.randperm(X_train.size(0))
             
-            # Split into Support and Query
-            # If dataset is small, we might use all.
-            # Let's use a random split, e.g., 50% support, 50% query (or limited by max seq len)
             n_samples = X_train.size(0)
             n_support = int(n_samples * 0.5)
             if n_support < 1: n_support = 1
@@ -202,32 +262,20 @@ def train_one_dataset(args, dataset_name, model, reader, device):
             X_batch = X_train[indices].unsqueeze(0) # (1, N, C, L)
             y_batch = y_train[indices].unsqueeze(0) # (1, N)
             
-            # y_train_input for TabICL is just the support labels
-            y_support = y_batch[:, :n_support]
-            y_query = y_batch[:, n_support:]
+            y_support = y_batch[:, :n_support].to(device)
+            y_query = y_batch[:, n_support:].to(device)
             
-            # Remap labels to 0..k-1 based on support set
-            # This ensures TabICL receives valid 0..k-1 labels and outputs k logits.
             unique_classes, inverse_indices = torch.unique(y_support[0], return_inverse=True)
             y_support_mapped = inverse_indices.unsqueeze(0)
             
-            # Map query labels
             max_label = max(y_support.max(), y_query.max()).item()
             mapper = torch.full((max_label + 1,), -1, dtype=torch.long, device=device)
             mapper[unique_classes] = torch.arange(len(unique_classes), device=device)
             
             y_query_mapped = mapper[y_query]
             
-            # Forward
-            # TabICL output is (B, N_Query, n_classes)
-            # Pass remapped support labels
             logits, adapter_out = model(X_batch, y_support_mapped)
             
-            # Loss
-            # logits: (1, N_Query, n_classes)
-            # y_query: (1, N_Query)
-            
-            # Filter valid query samples (those whose class is in support)
             valid_mask = (y_query_mapped != -1).view(-1)
             if not valid_mask.any():
                 continue
@@ -237,46 +285,57 @@ def train_one_dataset(args, dataset_name, model, reader, device):
             
             loss_ce = criterion(logits_flat[valid_mask], y_query_flat[valid_mask])
             
-            # Diversity Loss
-            loss_div = div_loss_fn(adapter_out.reshape(-1, adapter_out.size(-1)))
+            # Diversity Loss (Disabled as per user request in previous turn, but keeping logic consistent)
+            # loss_div = div_loss_fn(adapter_out.reshape(-1, adapter_out.size(-1)))
+            # total_loss = loss_ce + args.div_weight * loss_div
             
-            total_loss = loss_ce + args.div_weight * loss_div
+            total_loss = loss_ce
+            
+            if not total_loss.requires_grad:
+                 dummy = sum(p.sum() for p in model.adapter.parameters()) * 0.0
+                 total_loss = total_loss + dummy
             
             total_loss.backward()
             optimizer.step()
+            pbar.set_postfix({'loss': total_loss.item(), 'ce': loss_ce.item()})
             
-            pbar.set_postfix({'loss': total_loss.item(), 'ce': loss_ce.item(), 'div': loss_div.item()})
+        # Clear memory
+        del optimizer, criterion, div_loss_fn
+        torch.cuda.empty_cache()
     else:
         print(f"Skipping training for {dataset_name} (No Adapter)")
 
-    # 3. Evaluation
-    model.eval()
-    with torch.no_grad():
-        # Use all X_train as support, predict X_test
-        # We might need to batch X_test if it's too large
-        
-        # Support
-        X_support = X_train.unsqueeze(0)
-        y_support = y_train.unsqueeze(0)
-        
-        # Query
-        X_query = X_test.unsqueeze(0)
-        y_query = y_test.unsqueeze(0)
-        
-        # Combine for TabICL input: [Support, Query]
-        X_combined = torch.cat([X_support, X_query], dim=1)
-        
-        # Forward
-        # We need to handle OOM here too if X_combined is huge.
-        # But for now let's try direct forward.
-        
-        logits, _ = model(X_combined, y_support)
-        
-        preds = logits.argmax(dim=-1)
-        acc = (preds == y_query).float().mean().item()
-        
-        print(f"Result {dataset_name}: Accuracy = {acc:.4f}")
-        return acc
+    # 3. Evaluation with TabICLClassifier
+    print("Evaluating with TabICLClassifier...")
+    
+    # Extract embeddings
+    X_train_emb = get_embeddings(model, X_train, device)
+    X_test_emb = get_embeddings(model, X_test, device)
+    
+    # Initialize TabICLClassifier
+    # Note: We use the same checkpoint path.
+    # TabICLClassifier will load the model again.
+    
+    clf = TabICLClassifier(
+        model_path=args.tabicl_ckpt,
+        n_estimators=32,
+        device=device,
+        verbose=False,
+        mantis_checkpoint=None, # We already encoded
+        batch_size=8, # Inference batch size
+    )
+    
+    # Fit on training embeddings
+    # Note: y_train is tensor, convert to numpy
+    clf.fit(X_train_emb, y_train.numpy())
+    
+    # Predict on test embeddings
+    y_pred = clf.predict(X_test_emb)
+    
+    acc = np.mean(y_pred == y_test.numpy())
+    print(f"Result {dataset_name}: TabICLClassifier Accuracy = {acc:.4f}")
+    
+    return acc
 
 def main():
     parser = argparse.ArgumentParser()
@@ -292,10 +351,14 @@ def main():
     parser.add_argument("--no_adapter", action="store_true", help="Disable adapter and use raw Mantis embeddings")
     parser.add_argument("--mantis_batch_size", type=int, default=16, help="Batch size for Mantis encoder")
     parser.add_argument("--output_file", type=str, default=None, help="Path to save results JSON")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     
     args = parser.parse_args()
+    
+    set_seed(args.seed)
+    
     device = torch.device(args.device)
-    if device.type == 'cuda':
+    if device.type == 'cuda' and device.index is not None:
         torch.cuda.set_device(device)
     
     # 1. Build Models
@@ -303,30 +366,28 @@ def main():
     # Load Mantis
     mantis_model = build_mantis_encoder(args.mantis_ckpt, device=device)
     
-    # Load TabICL
+    # Load TabICL (for training adapter)
     tabicl_state = torch.load(args.tabicl_ckpt, map_location="cpu")
     tabicl_model = TabICL(**tabicl_state["config"])
     tabicl_model.load_state_dict(tabicl_state["state_dict"])
     tabicl_model.to(device)
     
     # Initialize Adapter
-    # Mantis Dim = 256 (default), TabICL Dim = 512 (default for TabICL?)
-    # Check TabICL config
     tabicl_dim = 100
     mantis_dim = mantis_model.hidden_dim
     
     print(f"Mantis Dim: {mantis_dim}, TabICL Dim: {tabicl_dim}")
     
-    # We need a fresh adapter for each dataset? 
-    # The user said "Train adapter on UCR/UEA train sets... One by one".
-    # This implies we reset the adapter for each dataset.
-    
     reader = DataReader(UEA_data_path=args.uea_path, UCR_data_path=args.ucr_path)
     
-    datasets = sorted(reader.dataset_list_ucr + reader.dataset_list_uea)
-    
     results = {}
-    
+    # selected_file = "./evaluation_results/mantisTabICL_uea_all_detailed.txt"
+    # if os.path.exists(selected_file):
+    #     datasets = load_dataset_names_from_file(selected_file)
+    # else:
+        # Fallback if file not found
+    datasets = sorted(reader.dataset_list_ucr)
+        
     for dataset_name in datasets:
         # Reset Adapter
         if args.no_adapter:
