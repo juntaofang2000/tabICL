@@ -2,6 +2,7 @@
 import argparse
 import os
 import sys
+import json
 import torch
 import numpy as np
 from torch import nn, optim
@@ -11,8 +12,7 @@ from tqdm import tqdm
 import copy
 
 # Add src to path
-sys.path.append(os.path.join(os.path.dirname(__file__), "../../"))
-sys.path.append(os.path.join(os.path.dirname(__file__), "../model"))
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../"))
 
 from tabicl.model.mantis_tabicl import MantisTabICL, build_mantis_encoder
 from tabicl.model.adapter import CALDA_Adapter, DistributionDiversityLoss
@@ -39,11 +39,12 @@ def resize_series(X, target_len=512):
     return X_resized
 
 class MantisAdapterTabICL(nn.Module):
-    def __init__(self, mantis_model, tabicl_model, adapter):
+    def __init__(self, mantis_model, tabicl_model, adapter, mantis_batch_size=16):
         super().__init__()
         self.mantis_model = mantis_model
         self.tabicl_model = tabicl_model
         self.adapter = adapter
+        self.mantis_batch_size = mantis_batch_size
         
         # Freeze Mantis and TabICL
         for param in self.mantis_model.parameters():
@@ -85,9 +86,17 @@ class MantisAdapterTabICL(nn.Module):
         # So we reshape to (B*N*C, 1, L).
         X_in = X.reshape(-1, L).unsqueeze(1) # (B*N*C, 1, L)
         
+        # Batch processing for Mantis to avoid OOM
+        mantis_outs = []
+        total_samples = X_in.size(0)
+        
         with torch.no_grad():
+            for i in range(0, total_samples, self.mantis_batch_size):
+                batch = X_in[i : i + self.mantis_batch_size]
+                out = self.mantis_model(batch)
+                mantis_outs.append(out)
             # Mantis output: (B*N*C, Mantis_Dim)
-            mantis_out = self.mantis_model(X_in)
+            mantis_out = torch.cat(mantis_outs, dim=0)
             
         # 2. Adapter
         # Reshape to (B*N, C, Mantis_Dim)
@@ -281,9 +290,13 @@ def main():
     parser.add_argument("--max_icl_len", type=int, default=512, help="Max sequence length for ICL training to avoid OOM")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--no_adapter", action="store_true", help="Disable adapter and use raw Mantis embeddings")
+    parser.add_argument("--mantis_batch_size", type=int, default=16, help="Batch size for Mantis encoder")
+    parser.add_argument("--output_file", type=str, default=None, help="Path to save results JSON")
     
     args = parser.parse_args()
     device = torch.device(args.device)
+    if device.type == 'cuda':
+        torch.cuda.set_device(device)
     
     # 1. Build Models
     print("Loading models...")
@@ -321,7 +334,7 @@ def main():
         else:
             adapter = CALDA_Adapter(mantis_emb_dim=mantis_dim, tabicl_input_dim=tabicl_dim).to(device)
         
-        model = MantisAdapterTabICL(mantis_model, tabicl_model, adapter).to(device)
+        model = MantisAdapterTabICL(mantis_model, tabicl_model, adapter, mantis_batch_size=args.mantis_batch_size).to(device)
         
         acc = train_one_dataset(args, dataset_name, model, reader, device)
         if acc is not None:
@@ -330,7 +343,23 @@ def main():
     print("\nFinal Results:")
     for name, acc in results.items():
         print(f"{name}: {acc:.4f}")
-    print(f"Average Accuracy: {np.mean(list(results.values())):.4f}")
+    
+    ucr_accs = [results[name] for name in results if name in reader.dataset_list_ucr]
+    uea_accs = [results[name] for name in results if name in reader.dataset_list_uea]
+    
+    if ucr_accs:
+        print(f"Average UCR Accuracy: {np.mean(ucr_accs):.4f}")
+    if uea_accs:
+        print(f"Average UEA Accuracy: {np.mean(uea_accs):.4f}")
+        
+    print(f"Overall Average Accuracy: {np.mean(list(results.values())):.4f}")
+
+    if args.output_file:
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(os.path.abspath(args.output_file)), exist_ok=True)
+        with open(args.output_file, 'w') as f:
+            json.dump(results, f, indent=4)
+        print(f"Results saved to {args.output_file}")
 
 if __name__ == "__main__":
     main()
