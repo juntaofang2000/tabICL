@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, Iterator, Optional
+from typing import Dict, Iterator, Optional, Union
 
 import torch
 from torch.utils.data import IterableDataset
@@ -44,10 +44,23 @@ class MixupPriorDataset(IterableDataset):
         self,
         batch_size: int,
         mixup_config: Optional[Dict[str, float]] = None,
+        min_seq_len: Optional[int] = None,
+        max_seq_len: int = 1000,
+        min_train_size: Union[int, float] = 0.1,
+        max_train_size: Union[int, float] = 0.9,
     ) -> None:
         super().__init__()
         self.batch_size = batch_size
         self.mixup_config = {**DEFAULT_MIXUP_CONFIG, **(mixup_config or {})}
+        
+        if min_seq_len is not None:
+            self.mixup_config['min_n_step'] = min_seq_len
+            self.mixup_config['max_n_step'] = max_seq_len
+        else:
+            self.mixup_config['n_step'] = max_seq_len
+
+        self.mixup_config['min_train_size'] = min_train_size
+        self.mixup_config['max_train_size'] = max_train_size
 
     def __iter__(self) -> Iterator[torch.Tensor]:
         dataset = MultiClassMixupDataset(self.mixup_config)

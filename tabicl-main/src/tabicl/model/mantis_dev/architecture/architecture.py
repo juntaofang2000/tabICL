@@ -292,14 +292,14 @@ class Mantis8M(
         # 将嵌入表示送入视觉转换器(vit_unit)进行处理
         vit_out = self.vit_unit(x_embeddings)
         # 根据是否处于预训练阶段来决定输出
-        if self.pre_training:
-            # 如果是预训练阶段，则通过投影层(prj)处理vit的输出
-            print("注意：当前Mantis8M模型处于预训练阶段，forward输出经过prj投影层处理")
-            return self.prj(vit_out)
-        else:
+        # if self.pre_training:
+        #     # 如果是预训练阶段，则通过投影层(prj)处理vit的输出
+        #     print("注意：当前Mantis8M模型处于预训练阶段，forward输出经过prj投影层处理")
+        #     return self.prj(vit_out)
+        # else:
             # 如果不是预训练阶段，则直接返回vit的输出
-            print("注意：当前Mantis8M模型不处于预训练阶段，forward输出为vit_unit的直接输出")
-            return vit_out
+        #print("注意：当前Mantis8M模型不处于预训练阶段，forward输出为vit_unit的直接输出")
+        return vit_out
 
 
 class Mantis8MWithFDDM(

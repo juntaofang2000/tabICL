@@ -123,7 +123,7 @@ def build_parser():
     parser.add_argument("--min_features", type=int, default=5, help="The minimum number of features")
     parser.add_argument("--max_features", type=int, default=100, help="The maximum number of features")
     parser.add_argument("--max_classes", type=int, default=10, help="The maximum number of classes")
-    parser.add_argument("--min_seq_len", type=int, default=None, help="Minimum samples per dataset")
+    parser.add_argument("--min_seq_len", type=int, default=10, help="Minimum samples per dataset")
     parser.add_argument("--max_seq_len", type=int, default=1024, help="Maximum samples per dataset")
     parser.add_argument(
         "--log_seq_len",
@@ -169,10 +169,10 @@ def build_parser():
         help="Optional JSON file overriding MultiClassMixupDataset settings when prior_type=mixup",
     )
     parser.add_argument("--mixup_n_bit", type=int, default=8, help="Default n_bit for mixup prior")
-    parser.add_argument("--mixup_n_step", type=int, default=120, help="Default n_step for mixup prior")
+    parser.add_argument("--mixup_n_step", type=int, default=1000, help="Default n_step for mixup prior")
     parser.add_argument("--mixup_max_class", type=int, default=5, help="Default max_class for mixup prior")
     parser.add_argument("--mixup_alpha", type=float, default=1.0, help="Dirichlet alpha for mixup prior")
-    parser.add_argument("--mixup_augment_cap", type=int, default=2, help="Augmentation count cap for mixup prior")
+    parser.add_argument("--mixup_augment_cap", type=int, default=5, help="Augmentation count cap for mixup prior")
 
     ###########################################################################
     ##### Model Architecture Config ###########################################

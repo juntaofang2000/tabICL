@@ -223,7 +223,14 @@ class MultiClassMixupDataset(IterableDataset):
         
         # Configuration
         self.n_bit = int(config_dict.get('n_bit', 8))
-        self.n_step = int(config_dict.get('n_step', 100))
+        self.n_step = int(config_dict.get('n_step', 1000))
+        self.min_n_step = config_dict.get('min_n_step', None)
+        self.max_n_step = config_dict.get('max_n_step', None)
+        if self.min_n_step is not None:
+            self.min_n_step = int(self.min_n_step)
+        if self.max_n_step is not None:
+            self.max_n_step = int(self.max_n_step)
+
         self.max_class = int(config_dict.get('max_class', 5)) # Support > 2 classes
         self.mix_alpha = float(config_dict.get('mix_alpha', 1.0)) # Dirichlet concentration
         
@@ -234,9 +241,17 @@ class MultiClassMixupDataset(IterableDataset):
             lambda x: no_change(x),
         ]
         self.augment_cap = int(config_dict.get('augment_cap', 2))
+        self.min_train_size = config_dict.get('min_train_size', 0.5)
+        self.max_train_size = config_dict.get('max_train_size', 0.5)
         
     def __iter__(self):
         while True:
+            # Determine n_step for this iteration
+            if self.min_n_step is not None and self.max_n_step is not None:
+                n_step = np.random.randint(self.min_n_step, self.max_n_step + 1)
+            else:
+                n_step = self.n_step
+
             # 1. Determine number of classes for this task (e.g., random between 3 and max_class)
             # We use >=3 to differentiate from the original binary logic, but 2 works too.
             n_class = np.random.randint(3, self.max_class + 1)
@@ -276,9 +291,9 @@ class MultiClassMixupDataset(IterableDataset):
             # alpha < 1 => samples concentrate near corners (easier, distinct classes)
             # alpha > 1 => samples concentrate in center (harder, very mixed)
             alpha_vec = [self.mix_alpha] * n_class
-            mix_weights = np.random.dirichlet(alpha_vec, size=self.n_step)
+            mix_weights = np.random.dirichlet(alpha_vec, size=n_step)
 
-            for i in range(self.n_step):
+            for i in range(n_step):
                 weights = mix_weights[i]
                 
                 # A. Mix the prototypes
@@ -329,13 +344,27 @@ class MultiClassMixupDataset(IterableDataset):
             x_batch = np.expand_dims(x_batch, axis=1) # (n_step, 1, time_len)
             
             # Shuffle
-            order = np.random.permutation(self.n_step)
+            order = np.random.permutation(n_step)
             x_batch = x_batch[order]
             y_batch = y_batch[order]
             y_bit_batch = y_bit_batch[order]
 
             # Split logic (Train/Test for ICL)
-            n_train = int(np.ceil(self.n_step / 2))
+            min_k = self.min_train_size
+            max_k = self.max_train_size
+            
+            if isinstance(min_k, float):
+                min_k = int(min_k * n_step)
+            if isinstance(max_k, float):
+                max_k = int(max_k * n_step)
+                
+            min_k = max(1, min_k)
+            max_k = min(n_step - 1, max_k)
+            
+            if min_k >= max_k:
+                n_train = min_k
+            else:
+                n_train = np.random.randint(min_k, max_k + 1)
             
             batch = {
                 'x_train': torch.tensor(x_batch[:n_train], dtype=torch.float32),
@@ -345,7 +374,7 @@ class MultiClassMixupDataset(IterableDataset):
                 'y_test': torch.tensor(y_batch[n_train:], dtype=torch.long),
                 # Masks would be added here as in original code
                 'mask_train': torch.zeros((n_train,), dtype=torch.bool),
-                'mask_test': torch.zeros((self.n_step - n_train,), dtype=torch.bool)
+                'mask_test': torch.zeros((n_step - n_train,), dtype=torch.bool)
             }
             
             yield batch

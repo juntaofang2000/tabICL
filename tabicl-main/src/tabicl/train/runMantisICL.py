@@ -257,6 +257,10 @@ class Trainer:
             dataset = MixupPriorDataset(
                 batch_size=self.config.batch_size,
                 mixup_config=mixup_config,
+                min_seq_len=self.config.min_seq_len,
+                max_seq_len=self.config.max_seq_len,
+                min_train_size=self.config.min_train_size,
+                max_train_size=self.config.max_train_size,
             )
         elif self.config.prior_dir is None:
             # Generate prior data on the fly
@@ -678,19 +682,20 @@ class Trainer:
 
         failure_ratio = failed_batches / num_micro_batches
         if failure_ratio > 0.1:
-            raise RuntimeError(
-                f"({failure_ratio:.1%}) of micro-batches failed due to OOM at step {self.curr_step}. "
-                f"Please check configuration to reduce memory consumption."
+            print(
+                f"Warning: ({failure_ratio:.1%}) of micro-batches failed due to OOM at step {self.curr_step}. "
+                f"Skipping optimization step if all failed."
             )
 
-        # Clip the gradient
-        if self.config.gradient_clipping > 0:
-            self.scaler.unscale_(self.optimizer)
-            nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clipping)
+        if failed_batches < num_micro_batches:
+            # Clip the gradient
+            if self.config.gradient_clipping > 0:
+                self.scaler.unscale_(self.optimizer)
+                nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clipping)
 
-        # Update parameters
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
+            # Update parameters
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
 
         # Update the learning rate
         self.optimizer.zero_grad(set_to_none=True)

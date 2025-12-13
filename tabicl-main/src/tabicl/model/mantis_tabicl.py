@@ -180,6 +180,7 @@ class MantisTabICL(nn.Module):
             device=self.device,
             hidden_dim=256,
             seq_len=512,
+        
         )
 
         # self.tabicl_model.eval()
@@ -189,58 +190,6 @@ class MantisTabICL(nn.Module):
         return next(self.tabicl_model.parameters()).device
 
 
-    # def _encode_with_mantis(self, X: Tensor, device: Optional[torch.device] = None) -> Tensor:
-    #     """Run the Mantis encoder over flattened batches to obtain per-row embeddings."""
-        
-    #     if X.ndim != 3:
-    #         raise ValueError(f"Mantis encoder expects a 3D array, got shape {X.shape}")
-        
-    #     B, T, H = X.shape
-    #     device = device or next(self.mantis_model.parameters()).device
-        
-    #     # Ensure input is a tensor on the correct device
-    #     if not isinstance(X, torch.Tensor):
-    #         X = torch.from_numpy(np.asarray(X, dtype=np.float32))
-    #     X = X.to(device)
-
-    #     # Reshape to (B*T, 1, H) for Mantis processing
-    #     # Mantis expects (Batch, SeqLen, Channels) where SeqLen=1 for row-wise encoding
-    #     X_reshaped = X.reshape(-1, 1, H)
-        
-    #     # Process in batches to avoid OOM if necessary, but keep gradients
-    #     # If mantis_batch_size is large enough, we can process all at once
-    #     # For training, we usually rely on the outer loop (Trainer) to handle batching via micro-batches
-    #     # So we can process the whole micro-batch here.
-        
-    #     # However, if B*T is very large, we might still want to chunk it.
-    #     # But chunking with gradients requires gathering the results.
-        
-    #     representations_list = []
-    #     total_samples = X_reshaped.size(0)
-        
-    #     for start in range(0, total_samples, self.mantis_batch_size):
-    #         end = min(start + self.mantis_batch_size, total_samples)
-    #         batch = X_reshaped[start:end]
-    #         # Forward pass through Mantis
-    #         reps = self.mantis_model(batch)
-    #         representations_list.append(reps)
-            
-    #     # Concatenate results
-    #     representations = torch.cat(representations_list, dim=0)
-        
-    #     # Reshape back to (B, T, D)
-    #     return representations.reshape(B, T, -1)
-        
-    #     X_flat = tensor.reshape(-1, 1, H)
-    #     outputs = []
-    #     for i in range(0, X_flat.size(0), self.mantis_batch_size):
-    #         batch = X_flat[i : i + self.mantis_batch_size]
-    #         out = self.mantis_model(batch)
-    #         outputs.append(out)
-            
-    #     concatenated = torch.cat(outputs, dim=0)
-    #     return concatenated.reshape(B, T, -1)
-    
     
     def _encode_with_mantis(self, X: Tensor, device: Optional[torch.device] = None) -> Tensor:
         """Run the Mantis encoder over flattened batches to obtain per-row embeddings."""
@@ -248,24 +197,30 @@ class MantisTabICL(nn.Module):
         if X.ndim != 3:
             raise ValueError(f"Mantis encoder expects a 3D array, got shape {X.shape}")
         
-        B, T, H = X.shape
-        # device = device or next(self.mantis_model.parameters()).device
-        
         # Ensure input is a tensor on the correct device
         if not isinstance(X, torch.Tensor):
             X = torch.from_numpy(np.asarray(X, dtype=np.float32))
-        X = X.to(self.device)
+        
+        target_device = device or self.device
+        X = X.to(target_device)
 
-        # Reshape to (B*T, 1, H) for Mantis processing
-        # Mantis expects (Batch, SeqLen, Channels) where SeqLen=1 for row-wise encoding
-        X_reshaped = X.reshape(-1, 1, H)
+        # print("mantis 多通道时序 各个通道单独提取")
         
-        # Forward pass through Mantis
-        # We process all at once since micro-batching is handled externally in Trainer
-        reps = self.mantis_model(X_reshaped)
+        # # Forward pass through Mantis
+        # # Pass X directly as (Batch, SeqLen, Channels)
+        # reps = self.mantis_model(X)
         
-        # Reshape back to (B, T, D)
-        return reps.reshape(B, T, -1)    
+        # return reps    
+        
+
+        # tensor = tensor.unsqueeze(1)
+        model = MantisTrainer(device=device, network=self.mantis_model)
+
+        print("mantis 多通道时序 各个通道单独提取")
+        z  =   model.transform(X,self.mantis_batch_size,to_numpy=False)
+        
+        return z
+        
     def forward(
         self,
         X: Tensor,
