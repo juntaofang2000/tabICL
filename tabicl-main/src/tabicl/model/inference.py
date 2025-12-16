@@ -5,7 +5,10 @@ import itertools
 from collections import OrderedDict
 from typing import List, Tuple, Dict, Callable, Iterator, Literal, Optional, Any
 
-import psutil
+try:
+    import psutil
+except ImportError:
+    psutil = None
 from tqdm.auto import tqdm
 
 import math
@@ -249,6 +252,8 @@ class InferenceManager:
         float
             Available CPU memory in MB
         """
+        if psutil is None:
+            return 8 * 1024.0 # Assume 8GB if psutil is missing
         return psutil.virtual_memory().available / (1024 * 1024)  # Convert to MB
 
     def get_available_gpu_memory(self) -> float:

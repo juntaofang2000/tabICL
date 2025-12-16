@@ -785,6 +785,8 @@ class FeatureShuffler:
 
         def _rls(symbols):
             n = len(symbols)
+            if n == 0:
+                return []
             if n == 1:
                 return [symbols]
             else:

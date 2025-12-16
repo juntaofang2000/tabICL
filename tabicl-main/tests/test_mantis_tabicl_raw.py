@@ -194,7 +194,7 @@ def load_mantis_tabicl(args: argparse.Namespace, device: torch.device) -> Mantis
         if not ckpt_path.is_file():
             raise FileNotFoundError(f"Composite checkpoint not found at {ckpt_path}")
         checkpoint = torch.load(ckpt_path, map_location="cpu")
-        state_dict = checkpoint.get("mantis_tabicl_state_dict")
+        state_dict = checkpoint.get("state_dict", checkpoint)
         if state_dict is None:
             raise KeyError(
                 f"Composite checkpoint {ckpt_path} is missing 'mantis_tabicl_state_dict'."
@@ -214,7 +214,7 @@ def build_argparser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--tabicl-ckpt", default=DEFAULT_TABICL_CHECKPOINT, help="Path to TabICL checkpoint")
     parser.add_argument("--mantis-ckpt", default=DEFAULT_MANTIS_CHECKPOINT, help="Path to Mantis checkpoint")
-    parser.add_argument("--composite-ckpt", default=None, help="Optional checkpoint containing mantis_tabicl_state_dict")
+    parser.add_argument("--composite-ckpt", default="/data0/fangjuntao2025/tabicl-main/mantis_tabiclcheckpointsMixup/step-5900.ckpt", help="Optional checkpoint containing mantis_tabicl_state_dict")
     parser.add_argument("--uea-path", default=DEFAULT_UEA_PATH, help="UEA dataset root directory")
     parser.add_argument("--ucr-path", default=DEFAULT_UCR_PATH, help="UCR dataset root directory")
     parser.add_argument("--device", default=None, help="Torch device to use (default: auto)")

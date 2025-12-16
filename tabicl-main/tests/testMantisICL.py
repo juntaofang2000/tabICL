@@ -11,7 +11,7 @@ from tabicl.prior.data_reader import DataReader
 
 
 DEFAULT_CHECKPOINT = (
-    "/data0/fangjuntao2025/tabicl-main/src/tabicl/checkpointsMantisICL/mixup_run_v1/step-2650.ckpt"
+    "/data0/fangjuntao2025/tabicl-main/checkpoints/mantisICL_mixup_run_v1/step-8000.ckpt"
 )
 DEFAULT_UEA_PATH = "/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UEAData/"
 DEFAULT_UCR_PATH = "/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UCRdata/"

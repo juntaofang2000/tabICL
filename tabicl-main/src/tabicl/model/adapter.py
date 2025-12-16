@@ -121,7 +121,7 @@ class CALDA_Adapter(nn.Module):
         self.bottleneck = nn.Linear(mantis_emb_dim, tabicl_input_dim)
         
         # 3. HDP: Handle distributional misalignment (White -> Diverse)
-        self.hdp = HeterogeneousDistributionProjector(input_dim=tabicl_input_dim)
+        #self.hdp = HeterogeneousDistributionProjector(input_dim=tabicl_input_dim)
 
     def forward(self, x):
         """
@@ -139,9 +139,9 @@ class CALDA_Adapter(nn.Module):
         z_proj = self.bottleneck(z_mixed) # -> (Batch, TabICL_Input_Dim)
         
         # 3. HDP
-        z_out = self.hdp(z_proj) # -> (Batch, TabICL_Input_Dim)
+        #z_out = self.hdp(z_proj) # -> (Batch, TabICL_Input_Dim)
         
-        return z_out
+        return z_proj
 
 class DistributionDiversityLoss(nn.Module):
     """
