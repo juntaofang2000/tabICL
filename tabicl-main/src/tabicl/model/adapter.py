@@ -1,6 +1,600 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Dict, Literal, Optional, Tuple
+
+
+class CausalDisentanglerAdapter(nn.Module):
+    """Cross-attention based adapter for multivariate time-series channel embeddings.
+
+    Design goals:
+    - No pooling/summing over the source channel dimension.
+    - Learn a small set of latent queries that attend to source channels, producing
+      a fixed number of latent "feature columns".
+
+    Input:
+        x: (B, Source_Channels, Emb_Dim)
+    Output:
+        z: (B, Num_Latents, Emb_Dim)
+    """
+
+    def __init__(
+        self,
+        emb_dim: int,
+        num_latents: int = 10,
+        num_heads: int = 4,
+        dropout: float = 0.0,
+        norm: str = "bn",
+        use_affine_norm: bool = False,
+    ):
+        super().__init__()
+
+        if emb_dim % num_heads != 0:
+            raise ValueError(f"emb_dim ({emb_dim}) must be divisible by num_heads ({num_heads}).")
+
+        self.emb_dim = int(emb_dim)
+        self.num_latents = int(num_latents)
+        self.num_heads = int(num_heads)
+
+        self.latent_queries = nn.Parameter(torch.randn(1, self.num_latents, self.emb_dim) * 0.02)
+
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=self.emb_dim,
+            num_heads=self.num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+        # Output normalization: stabilize distribution for downstream TabICL augmentations.
+        # BatchNorm1d expects (N, C, L). We treat Emb_Dim as channels.
+        norm = (norm or "").lower()
+        if norm in {"bn", "batchnorm", "batchnorm1d"}:
+            self.out_norm = nn.BatchNorm1d(self.emb_dim, affine=use_affine_norm)
+            self._norm_kind = "bn"
+        elif norm in {"ln", "layernorm"}:
+            self.out_norm = nn.LayerNorm(self.emb_dim, elementwise_affine=use_affine_norm)
+            self._norm_kind = "ln"
+        elif norm in {"none", "", None}:
+            self.out_norm = nn.Identity()
+            self._norm_kind = "none"
+        else:
+            raise ValueError(f"Unknown norm='{norm}'. Use 'bn', 'ln', or 'none'.")
+
+        # A small residual MLP helps expressiveness without collapsing channels.
+        self.ffn = nn.Sequential(
+            nn.Linear(self.emb_dim, self.emb_dim * 4),
+            nn.GELU(),
+            nn.Linear(self.emb_dim * 4, self.emb_dim),
+        )
+        self.pre_norm = nn.LayerNorm(self.emb_dim)
+        self.post_norm = nn.LayerNorm(self.emb_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.dim() != 3:
+            raise ValueError(f"Input must be (Batch, Source_Channels, Emb_Dim). Got shape {tuple(x.shape)}")
+        if x.size(-1) != self.emb_dim:
+            raise ValueError(
+                f"Last dim mismatch: expected Emb_Dim={self.emb_dim}, got {x.size(-1)}."
+            )
+
+        B = x.size(0)
+        q = self.latent_queries.expand(B, -1, -1)  # (B, Num_Latents, Emb_Dim)
+
+        # Cross-attention: Query=latent queries, Key/Value=source channels.
+        # No pooling over channels; attention learns to extract causal latents.
+        attn_out, _ = self.cross_attn(query=q, key=x, value=x, need_weights=False)
+
+        # Residual + FFN (Transformer-style)
+        z = self.pre_norm(attn_out)
+        z = z + self.ffn(z)
+        z = self.post_norm(z)
+
+        # Distribution alignment normalization
+        if self._norm_kind == "bn":
+            # (B, Num_Latents, Emb_Dim) -> (B, Emb_Dim, Num_Latents)
+            z = self.out_norm(z.transpose(1, 2)).transpose(1, 2)
+        else:
+            z = self.out_norm(z)
+
+        return z
+
+
+class CausalGNNLayer(nn.Module):
+    """A simple graph message-passing layer over K latent nodes.
+
+    Given latents Z with shape (B, K, D) and an adjacency matrix A with shape (K, K),
+    performs:
+        Z_new = Z + ReLU( A @ Z @ W )
+
+    where (A @ Z)[b, i, :] = sum_j A[i, j] * Z[b, j, :]
+    """
+
+    def __init__(self, emb_dim: int, bias: bool = True):
+        super().__init__()
+        self.emb_dim = int(emb_dim)
+        self.proj = nn.Linear(self.emb_dim, self.emb_dim, bias=bias)
+
+    def forward(self, z: torch.Tensor, A: torch.Tensor) -> torch.Tensor:
+        if z.dim() != 3:
+            raise ValueError(f"z must be (B, K, D). Got shape {tuple(z.shape)}")
+        if A.dim() != 2 or A.size(0) != A.size(1):
+            raise ValueError(f"A must be (K, K). Got shape {tuple(A.shape)}")
+        if z.size(1) != A.size(0):
+            raise ValueError(
+                f"K mismatch: z has K={z.size(1)} but A is {tuple(A.shape)}"
+            )
+
+        # (B, K, D)
+        msg = torch.einsum("ij,bjd->bid", A, z)
+        msg = self.proj(msg)
+        return z + F.relu(msg)
+
+
+class StructuralCausalAdapter(nn.Module):
+    """Structural causal adapter with (i) disentanglement and (ii) structure learning.
+
+    Pipeline:
+      1) Disentanglement Phase:
+         - Cross-attention extracts K latent variables Z in R^{B x K x D}.
+         - Independence regularization encourages distinct causal mechanisms.
+      2) Causal Discovery Phase:
+         - Learn a global, sparse adjacency A in {0,1}^{KxK} (relaxed via Gumbel-Sigmoid).
+         - Graph refinement updates latents using a causal GNN layer.
+
+    Forward returns:
+        output_features: (B, K, D)
+        aux_loss_dict: {"independence_loss": ..., "sparsity_loss": ..., "adjacency": ..., "adjacency_prob": ...}
+    """
+
+    def __init__(
+        self,
+        emb_dim: int,
+        num_latents: int = 10,
+        num_heads: int = 4,
+        dropout: float = 0.0,
+        norm: str = "bn",
+        use_affine_norm: bool = False,
+        independence: Literal["orth", "hsic"] = "orth",
+        hsic_kernel: Literal["rbf", "linear"] = "rbf",
+        hsic_sigma: float = 1.0,
+        gumbel_tau: float = 1.0,
+        gumbel_hard: bool = False,
+        allow_self_edges: bool = False,
+        sparsity_on: Literal["prob", "sample"] = "prob",
+    ):
+        super().__init__()
+
+        if emb_dim % num_heads != 0:
+            raise ValueError(f"emb_dim ({emb_dim}) must be divisible by num_heads ({num_heads}).")
+
+        self.emb_dim = int(emb_dim)
+        self.num_latents = int(num_latents)
+        self.num_heads = int(num_heads)
+        self.independence = independence
+        self.hsic_kernel = hsic_kernel
+        self.hsic_sigma = float(hsic_sigma)
+        self.gumbel_tau = float(gumbel_tau)
+        self.gumbel_hard = bool(gumbel_hard)
+        self.allow_self_edges = bool(allow_self_edges)
+        self.sparsity_on = sparsity_on
+
+        # ---- 1) Disentanglement (cross-attn latent extraction) ----
+        self.latent_queries = nn.Parameter(torch.randn(1, self.num_latents, self.emb_dim) * 0.02)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=self.emb_dim,
+            num_heads=self.num_heads,
+            dropout=dropout,
+            batch_first=True,
+        )
+
+        norm_lc = (norm or "").lower()
+        if norm_lc in {"bn", "batchnorm", "batchnorm1d"}:
+            self.out_norm = nn.BatchNorm1d(self.emb_dim, affine=use_affine_norm)
+            self._norm_kind = "bn"
+        elif norm_lc in {"ln", "layernorm"}:
+            self.out_norm = nn.LayerNorm(self.emb_dim, elementwise_affine=use_affine_norm)
+            self._norm_kind = "ln"
+        elif norm_lc in {"none", "", None}:
+            self.out_norm = nn.Identity()
+            self._norm_kind = "none"
+        else:
+            raise ValueError(f"Unknown norm='{norm}'. Use 'bn', 'ln', or 'none'.")
+
+        self.ffn = nn.Sequential(
+            nn.Linear(self.emb_dim, self.emb_dim * 4),
+            nn.GELU(),
+            nn.Linear(self.emb_dim * 4, self.emb_dim),
+        )
+        self.pre_norm = nn.LayerNorm(self.emb_dim)
+        self.post_norm = nn.LayerNorm(self.emb_dim)
+
+        # ---- 2) Causal discovery (global structure learning + graph refinement) ----
+        # Learn global adjacency logits (shared across batch).
+        # We'll sample a relaxed adjacency via Gumbel-Sigmoid for differentiability.
+        self.adj_logits = nn.Parameter(torch.zeros(self.num_latents, self.num_latents))
+        self.gnn = CausalGNNLayer(emb_dim=self.emb_dim)
+
+        if not self.allow_self_edges:
+            self.register_buffer("_diag_mask", (1.0 - torch.eye(self.num_latents)), persistent=False)
+        else:
+            self.register_buffer("_diag_mask", torch.ones(self.num_latents, self.num_latents), persistent=False)
+
+    @staticmethod
+    def _gumbel_sigmoid(
+        logits: torch.Tensor,
+        tau: float = 1.0,
+        hard: bool = False,
+        eps: float = 1e-10,
+    ) -> torch.Tensor:
+        """Sample from the Binary Concrete / Gumbel-Sigmoid distribution."""
+        if tau <= 0:
+            raise ValueError(f"tau must be > 0, got {tau}")
+        u = torch.rand_like(logits)
+        g = -torch.log(-torch.log(u.clamp_min(eps)).clamp_min(eps))
+        y = torch.sigmoid((logits + g) / tau)
+        if hard:
+            y_hard = (y > 0.5).to(y.dtype)
+            y = (y_hard - y).detach() + y
+        return y
+
+    @staticmethod
+    def _orthogonality_loss(z: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+        """Encourage pairwise orthogonality among the K latents (per sample).
+
+        z: (B, K, D)
+        Returns scalar loss.
+        """
+        z_norm = z / (z.norm(dim=-1, keepdim=True) + eps)
+        # Gram: (B, K, K)
+        gram = torch.matmul(z_norm, z_norm.transpose(1, 2))
+        off_diag = gram - torch.diag_embed(torch.diagonal(gram, dim1=1, dim2=2))
+        return (off_diag ** 2).mean()
+
+    @staticmethod
+    def _center_gram(K: torch.Tensor) -> torch.Tensor:
+        n = K.size(0)
+        eye = torch.eye(n, device=K.device, dtype=K.dtype)
+        ones = torch.ones(n, n, device=K.device, dtype=K.dtype) / float(n)
+        H = eye - ones
+        return H @ K @ H
+
+    def _hsic_pair(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+        """Empirical HSIC(x, y) using either linear or RBF kernel.
+
+        x, y: (N, D)
+        Returns scalar HSIC.
+        """
+        if x.dim() != 2 or y.dim() != 2 or x.size(0) != y.size(0):
+            raise ValueError(f"x,y must be (N,D) with same N. Got {tuple(x.shape)}, {tuple(y.shape)}")
+        N = x.size(0)
+        if N < 2:
+            return x.new_tensor(0.0)
+
+        if self.hsic_kernel == "linear":
+            Kx = x @ x.t()
+            Ky = y @ y.t()
+        else:
+            # RBF
+            x2 = (x ** 2).sum(dim=1, keepdim=True)
+            y2 = (y ** 2).sum(dim=1, keepdim=True)
+            dx = x2 + x2.t() - 2.0 * (x @ x.t())
+            dy = y2 + y2.t() - 2.0 * (y @ y.t())
+            sigma2 = (self.hsic_sigma ** 2)
+            Kx = torch.exp(-dx / (2.0 * sigma2))
+            Ky = torch.exp(-dy / (2.0 * sigma2))
+
+        Kx = self._center_gram(Kx)
+        Ky = self._center_gram(Ky)
+        hsic = (Kx * Ky).sum() / ((N - 1) ** 2)
+        return hsic
+
+    def compute_independence_loss(self, z: torch.Tensor) -> torch.Tensor:
+        """Compute independence loss among K latents.
+
+        Supported:
+          - "orth": orthogonality loss on latent vectors.
+          - "hsic": average pairwise HSIC across latents (computed on flattened embeddings).
+        """
+        if z.dim() != 3:
+            raise ValueError(f"Expected z to be (B, K, D). Got shape {tuple(z.shape)}")
+
+        if self.independence == "orth":
+            return self._orthogonality_loss(z)
+
+        # HSIC mode: treat each latent k as a variable with samples across batch.
+        # We flatten embedding dimensions into a vector per sample.
+        B, K, D = z.shape
+        if B < 4 or K < 2:
+            return z.new_tensor(0.0)
+        z_flat = z.reshape(B, K, D)
+        total = 0.0
+        count = 0
+        for i in range(K):
+            xi = z_flat[:, i, :]
+            for j in range(i + 1, K):
+                yj = z_flat[:, j, :]
+                total = total + self._hsic_pair(xi, yj)
+                count += 1
+        return total / max(count, 1)
+
+    def sample_adjacency(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (A_sample, A_prob) each with shape (K, K)."""
+        logits = self.adj_logits * self._diag_mask
+        A_prob = torch.sigmoid(logits)
+        A_sample = self._gumbel_sigmoid(logits, tau=self.gumbel_tau, hard=self.gumbel_hard)
+        A_sample = A_sample * self._diag_mask
+        return A_sample, A_prob
+
+    def compute_sparsity_loss(self, A_sample: torch.Tensor, A_prob: torch.Tensor) -> torch.Tensor:
+        if self.sparsity_on == "sample":
+            return A_sample.abs().mean()
+        return A_prob.abs().mean()
+
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if x.dim() != 3:
+            raise ValueError(f"Input must be (Batch, Source_Channels, Emb_Dim). Got shape {tuple(x.shape)}")
+        if x.size(-1) != self.emb_dim:
+            raise ValueError(f"Last dim mismatch: expected Emb_Dim={self.emb_dim}, got {x.size(-1)}.")
+
+        B = x.size(0)
+        q = self.latent_queries.expand(B, -1, -1)  # (B, K, D)
+
+        # Cross-attention: Query=latent queries, Key/Value=source channels.
+        z_attn, _ = self.cross_attn(query=q, key=x, value=x, need_weights=False)
+
+        # Residual + FFN (Transformer-style)
+        z = self.pre_norm(z_attn)
+        z = z + self.ffn(z)
+        z = self.post_norm(z)
+
+        # Distribution alignment normalization
+        if self._norm_kind == "bn":
+            z = self.out_norm(z.transpose(1, 2)).transpose(1, 2)
+        else:
+            z = self.out_norm(z)
+
+        # ---- Independence of mechanisms ----
+        independence_loss = self.compute_independence_loss(z)
+
+        # ---- Global causal structure learning + graph refinement ----
+        # A_sample, A_prob = self.sample_adjacency()
+        # sparsity_loss = self.compute_sparsity_loss(A_sample, A_prob)
+        # z_refined = self.gnn(z, A_sample)
+
+        # aux: Dict[str, torch.Tensor] = {
+        #     "independence_loss": independence_loss,
+        #     "sparsity_loss": sparsity_loss,
+        #     # Provide adjacency tensors for logging/analysis.
+        #     "adjacency": A_sample,
+        #     "adjacency_prob": A_prob,
+        # }
+        #return z_refined, aux
+        aux: Dict[str, torch.Tensor] = {
+             "independence_loss": independence_loss,}
+        return  z,aux
+        
+        
+        
+
+
+class ICLAlignmentLoss(nn.Module):
+    """Loss that aligns adapter outputs to an ICL-friendly metric space.
+
+    Components:
+    1) Prototypical Networks loss computed from a support/query split.
+    2) KL regularizer that encourages features to match N(0, I) (approximate) to
+       reduce distribution shift under TabICL-style quantile/power transforms.
+
+    Expected usage:
+        z = adapter(x)  # (B, Num_Latents, Emb_Dim)
+        loss = loss_fn(z, y, n_support=K)
+    """
+
+    def __init__(
+        self,
+        n_support: int = 5,
+        kl_weight: float = 1e-2,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.n_support = int(n_support)
+        self.kl_weight = float(kl_weight)
+        self.eps = float(eps)
+
+    @staticmethod
+    def _flatten_features(z: torch.Tensor) -> torch.Tensor:
+        # Accept (B, D) or (B, L, D). Flatten latents into feature dimension.
+        if z.dim() == 2:
+            return z
+        if z.dim() == 3:
+            return z.reshape(z.size(0), -1)
+        raise ValueError(f"Expected z to have 2 or 3 dims, got shape {tuple(z.shape)}")
+
+    def _proto_logits_from_episode(
+        self,
+        z_support: torch.Tensor,
+        y_support: torch.Tensor,
+        z_query: torch.Tensor,
+        y_query: torch.Tensor,
+    ):
+        """Compute ProtoNet logits for a single episode.
+
+        Inputs:
+            z_support: (N_support, D) or (N_support, L, D)
+            y_support: (N_support,)
+            z_query: (N_query, D) or (N_query, L, D)
+            y_query: (N_query,)
+        Returns:
+            logits: (N_query_valid, N_classes)
+            y_query_mapped: (N_query_valid,)
+        """
+        z_s = self._flatten_features(z_support)
+        z_q = self._flatten_features(z_query)
+
+        y_s = y_support.view(-1)
+        y_q = y_query.view(-1)
+
+        device = z_s.device
+        classes = torch.unique(y_s)
+        classes = classes[torch.argsort(classes)]
+        if classes.numel() < 2:
+            return None, None
+
+        # Prototypes from support
+        prototypes = []
+        for c in classes:
+            idx = torch.nonzero(y_s == c, as_tuple=False).view(-1)
+            if idx.numel() == 0:
+                continue
+            prototypes.append(z_s[idx].mean(dim=0))
+        if len(prototypes) < 2:
+            return None, None
+        prototypes = torch.stack(prototypes, dim=0)  # (N_classes, D)
+
+        # Map query labels into [0..N_classes-1], drop unknown labels
+        max_label = int(max(int(y_s.max().item()), int(y_q.max().item())))
+        mapper = torch.full((max_label + 1,), -1, dtype=torch.long, device=device)
+        mapper[classes] = torch.arange(classes.numel(), device=device)
+        y_q_mapped = mapper[y_q]
+        valid = y_q_mapped != -1
+        if not valid.any():
+            return None, None
+
+        z_q = z_q[valid]
+        y_q_mapped = y_q_mapped[valid]
+
+        # Squared euclidean distances -> logits = -dist
+        z_q2 = (z_q ** 2).sum(dim=1, keepdim=True)
+        p2 = (prototypes ** 2).sum(dim=1).unsqueeze(0)
+        cross = z_q @ prototypes.t()
+        dists = z_q2 + p2 - 2.0 * cross
+        logits = -dists
+        return logits, y_q_mapped
+
+    def _proto_logits(
+        self,
+        z: torch.Tensor,
+        y: torch.Tensor,
+        n_support: int,
+    ):
+        """Compute ProtoNet logits for all query samples in the batch.
+
+        Returns:
+            logits: (N_query, N_classes)
+            y_query_mapped: (N_query,)
+        """
+        if y.dim() != 1:
+            y = y.view(-1)
+
+        device = z.device
+        classes = torch.unique(y)
+        classes = classes[torch.argsort(classes)]
+        n_classes = classes.numel()
+
+        # Build support/query indices per class.
+        support_indices = []
+        query_indices = []
+        query_class_targets = []
+
+        for class_idx, c in enumerate(classes):
+            idx = torch.nonzero(y == c, as_tuple=False).view(-1)
+            if idx.numel() < n_support + 1:
+                # Need at least 1 query sample to contribute.
+                continue
+            sup = idx[:n_support]
+            qry = idx[n_support:]
+            support_indices.append(sup)
+            query_indices.append(qry)
+            query_class_targets.append(torch.full((qry.numel(),), class_idx, device=device, dtype=torch.long))
+
+        if len(support_indices) < 2:
+            # Not enough classes with query samples to form meaningful episodic loss.
+            return None, None
+
+        # Prototypes: mean of support embeddings per class.
+        prototypes = []
+        kept_classes = []
+        for class_idx, sup in enumerate(support_indices):
+            prototypes.append(z[sup].mean(dim=0))
+            kept_classes.append(class_idx)
+        prototypes = torch.stack(prototypes, dim=0)  # (N_kept_classes, D)
+
+        # Queries
+        qry_idx = torch.cat(query_indices, dim=0)
+        z_q = z[qry_idx]  # (N_query, D)
+        y_q = torch.cat(query_class_targets, dim=0)  # (N_query,)
+
+        # Squared euclidean distances -> logits = -dist
+        # dist(i, j) = ||z_q[i] - proto[j]||^2
+        z_q2 = (z_q ** 2).sum(dim=1, keepdim=True)  # (N_query, 1)
+        p2 = (prototypes ** 2).sum(dim=1).unsqueeze(0)  # (1, N_kept)
+        cross = z_q @ prototypes.t()  # (N_query, N_kept)
+        dists = z_q2 + p2 - 2.0 * cross
+        logits = -dists
+
+        return logits, y_q
+
+    def _kl_to_standard_normal(self, z_flat: torch.Tensor) -> torch.Tensor:
+        """Approximate KL between N(mu, diag(var)) and N(0, I).
+
+        We estimate per-dimension mean/var over the current batch and penalize:
+            KL = 0.5 * sum(mu^2 + var - log(var) - 1)
+        """
+        mu = z_flat.mean(dim=0)
+        var = z_flat.var(dim=0, unbiased=False).clamp_min(self.eps)
+        kl_per_dim = 0.5 * (mu ** 2 + var - torch.log(var) - 1.0)
+        return kl_per_dim.mean()
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        y: torch.Tensor,
+        n_support: int | None = None,
+    ) -> torch.Tensor:
+        n_support = self.n_support if n_support is None else int(n_support)
+        if n_support < 1:
+            raise ValueError(f"n_support must be >= 1, got {n_support}")
+
+        z_flat = self._flatten_features(z)
+        logits_y = self._proto_logits(z_flat, y, n_support=n_support)
+
+        if logits_y[0] is None:
+            # Fall back: only KL regularization if episodic split isn't viable.
+            return self.kl_weight * self._kl_to_standard_normal(z_flat)
+
+        logits, y_query = logits_y
+        proto_loss = F.cross_entropy(logits, y_query)
+        kl_loss = self._kl_to_standard_normal(z_flat)
+        return proto_loss + self.kl_weight * kl_loss
+
+    def forward_episode(
+        self,
+        z_support: torch.Tensor,
+        y_support: torch.Tensor,
+        z_query: torch.Tensor,
+        y_query: torch.Tensor,
+    ) -> torch.Tensor:
+        """Explicit episodic ProtoNet + KL.
+
+        This matches the typical ICL setting where you already have a support/query split.
+        """
+        logits_y = self._proto_logits_from_episode(z_support, y_support, z_query, y_query)
+        if logits_y[0] is None:
+            z_all = torch.cat([
+                self._flatten_features(z_support),
+                self._flatten_features(z_query),
+            ], dim=0)
+            return self.kl_weight * self._kl_to_standard_normal(z_all)
+
+        logits, y_q = logits_y
+        proto_loss = F.cross_entropy(logits, y_q)
+        z_all = torch.cat([
+            self._flatten_features(z_support),
+            self._flatten_features(z_query),
+        ], dim=0)
+        #kl_loss = self._kl_to_standard_normal(z_all)
+        #return proto_loss + self.kl_weight * kl_loss
+        return proto_loss
 
 class GatedAttentionPooling(nn.Module):
     """

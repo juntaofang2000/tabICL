@@ -15,7 +15,7 @@ import copy
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../"))
 
 from tabicl.model.mantis_tabicl import MantisTabICL, build_mantis_encoder
-from tabicl.model.adapter import StructuralCausalAdapter, ICLAlignmentLoss
+from tabicl.model.adapterOrign import CALDA_Adapter, DistributionDiversityLoss
 from tabicl.prior.data_reader import DataReader
 from tabicl.model.tabicl import TabICL
 from tabicl.sklearn.classifier import TabICLClassifier
@@ -61,12 +61,11 @@ def resize_series(X, target_len=512):
     return X_resized
 
 class MantisAdapterTabICL(nn.Module):
-    def __init__(self, mantis_model, tabicl_model, adapter, projector=None, mantis_batch_size=16):
+    def __init__(self, mantis_model, tabicl_model, adapter, mantis_batch_size=16):
         super().__init__()
         self.mantis_model = mantis_model
         self.tabicl_model = tabicl_model
         self.adapter = adapter
-        self.projector = projector
         self.mantis_batch_size = mantis_batch_size
         
         # Freeze Mantis and TabICL
@@ -116,12 +115,6 @@ class MantisAdapterTabICL(nn.Module):
             for i in range(0, mantis_out_reshaped.size(0), adapter_batch_size):
                 batch_slice = mantis_out_reshaped[i : i + adapter_batch_size]
                 out_slice = self.adapter(batch_slice)
-                if isinstance(out_slice, (tuple, list)):
-                    out_slice = out_slice[0]
-                if out_slice.dim() == 3:
-                    out_slice = out_slice.reshape(out_slice.size(0), -1)
-                if self.projector is not None:
-                    out_slice = self.projector(out_slice)
                 adapter_outs.append(out_slice)
             adapter_out = torch.cat(adapter_outs, dim=0)
         else:
@@ -133,7 +126,7 @@ class MantisAdapterTabICL(nn.Module):
         
         return out, adapter_out
 
-    def get_adapter_output(self, X, return_aux: bool = False):
+    def get_adapter_output(self, X):
         """
         Get embeddings from Mantis + Adapter without passing through TabICL.
         Useful for applying augmentations before TabICL.
@@ -162,9 +155,6 @@ class MantisAdapterTabICL(nn.Module):
         # 2. Adapter
         mantis_out_reshaped = mantis_out.reshape(B*N, C, -1)
         
-        aux_sum = None
-        aux_count = 0
-
         if self.adapter is not None:
             # Batch execution for Adapter
             adapter_outs = []
@@ -172,48 +162,12 @@ class MantisAdapterTabICL(nn.Module):
             for i in range(0, mantis_out_reshaped.size(0), adapter_batch_size):
                 batch_slice = mantis_out_reshaped[i : i + adapter_batch_size]
                 out_slice = self.adapter(batch_slice)
-                aux_slice = None
-                if isinstance(out_slice, (tuple, list)):
-                    out_slice, aux_slice = out_slice
-                if out_slice.dim() == 3:
-                    out_slice = out_slice.reshape(out_slice.size(0), -1)
-                if self.projector is not None:
-                    out_slice = self.projector(out_slice)
                 adapter_outs.append(out_slice)
-
-                if return_aux and aux_slice is not None:
-                    # Only aggregate scalar losses here; adjacency is global and can be logged elsewhere.
-                    indep = aux_slice.get("independence_loss", None)
-                    sparse = aux_slice.get("sparsity_loss", None)
-                    if indep is not None and sparse is not None:
-                        if aux_sum is None:
-                            aux_sum = {
-                                "independence_loss": indep,
-                                "sparsity_loss": sparse,
-                            }
-                        else:
-                            aux_sum["independence_loss"] = aux_sum["independence_loss"] + indep
-                            aux_sum["sparsity_loss"] = aux_sum["sparsity_loss"] + sparse
-                        aux_count += 1
             adapter_out = torch.cat(adapter_outs, dim=0)
         else:
             adapter_out = mantis_out_reshaped.reshape(B*N, -1)
-
-        out = adapter_out.reshape(B, N, -1)
-        if not return_aux:
-            return out
-
-        if aux_sum is None or aux_count == 0:
-            aux = {
-                "independence_loss": torch.tensor(0.0, device=out.device, requires_grad=True),
-                "sparsity_loss": torch.tensor(0.0, device=out.device, requires_grad=True),
-            }
-        else:
-            aux = {
-                "independence_loss": aux_sum["independence_loss"] / float(aux_count),
-                "sparsity_loss": aux_sum["sparsity_loss"] / float(aux_count),
-            }
-        return out, aux
+            
+        return adapter_out.reshape(B, N, -1)
 
 def augment_batch(X, y_support, y_query, device, n_classes):
     """
@@ -274,13 +228,7 @@ def get_embeddings(model, X_data, device, batch_size=64):
             # Adapter
             mantis_out_reshaped = mantis_out.reshape(B, C, -1)
             if model.adapter is not None:
-                adapter_out = model.adapter(mantis_out_reshaped)
-                if isinstance(adapter_out, (tuple, list)):
-                    adapter_out = adapter_out[0]
-                if adapter_out.dim() == 3:
-                    adapter_out = adapter_out.reshape(adapter_out.size(0), -1)
-                if getattr(model, "projector", None) is not None:
-                    adapter_out = model.projector(adapter_out)
+                adapter_out = model.adapter(mantis_out_reshaped) # (B, TabICL_Dim)
             else:
                 adapter_out = mantis_out_reshaped.reshape(B, -1)
                 
@@ -307,7 +255,7 @@ def load_dataset_data(reader, dataset_name):
     
     return X_train, y_train, X_test, y_test
 
-def train_step(model, optimizer, icl_loss_fn, batch_datasets, device, args):
+def train_step(model, optimizer, criterion, batch_datasets, device, args):
     model.train()
     optimizer.zero_grad()
     
@@ -318,7 +266,7 @@ def train_step(model, optimizer, icl_loss_fn, batch_datasets, device, args):
     
     # Ensure n_support is at least 1
     if n_support < 1:
-        return None
+        return 0.0
 
     X_seq_list = []
     y_sup_mapped_list = []
@@ -369,24 +317,18 @@ def train_step(model, optimizer, icl_loss_fn, batch_datasets, device, args):
     
     # Ensure target_len > n_support (so we have at least some query samples)
     if target_len <= n_support:
-        return None
+        return 0.0
 
     adapter_out_list = []
     y_sup_batch_list = []
     y_qry_batch_list = []
     mask_batch_list = []
     
-    indep_losses = []
-    sparse_losses = []
-
     for i in range(len(batch_datasets)):
         # Truncate X and get embeddings individually to handle variable channels
         x_item = X_seq_list[i][:target_len]
-        emb_aux = model.get_adapter_output(x_item.unsqueeze(0), return_aux=True)  # (1, L, D), aux
-        emb, aux = emb_aux
+        emb = model.get_adapter_output(x_item.unsqueeze(0)) # (1, L, D)
         adapter_out_list.append(emb.squeeze(0))
-        indep_losses.append(aux["independence_loss"])
-        #sparse_losses.append(aux["sparsity_loss"])
 
         # y_sup is fixed size n_support
         y_sup_batch_list.append(y_sup_mapped_list[i])
@@ -432,58 +374,52 @@ def train_step(model, optimizer, icl_loss_fn, batch_datasets, device, args):
     y_qry_aug_batch = torch.stack(aug_y_qry_list)
     valid_mask_batch = torch.stack(aug_mask_list)
     
-    # ProtoNet + KL (ICLAlignmentLoss) over augmented episodes
+    # Forward
+    # We process tasks individually to avoid "same number of classes" error in TabICL
     total_loss = 0.0
-    used = 0
+    
     for i in range(X_aug_batch.size(0)):
-        X_full = X_aug_batch[i]  # (L, D)
-        y_sup = y_sup_aug_batch[i]  # (n_support,)
-        y_qry = y_qry_aug_batch[i]  # (qry_len,)
-        mask_in = valid_mask_batch[i]  # (qry_len,)
-
+        # Slice for single task
+        X_in = X_aug_batch[i].unsqueeze(0) # (1, L, D)
+        y_sup_in = y_sup_aug_batch[i].unsqueeze(0) # (1, n_support)
+        y_qry_in = y_qry_aug_batch[i].unsqueeze(0) # (1, qry_len)
+        mask_in = valid_mask_batch[i] # (qry_len,)
+        
         if not mask_in.any():
             continue
+            
+        # Forward TabICL (Batch size = 1)
+        logits = model.tabicl_model(X_in, y_sup_in, return_logits=True)
+        
+        # Handle logits shape
+        # If logits corresponds to full sequence, take the query part (last qry_len)
+        qry_len = y_qry_in.size(1)
+        if logits.size(1) == X_in.size(1):
+             logits_qry = logits[:, -qry_len:, :]
+        else:
+             logits_qry = logits
+             
+        # Flatten
+        logits_flat = logits_qry.reshape(-1, logits_qry.size(-1))
+        y_flat = y_qry_in.reshape(-1)
+        mask_flat = mask_in.reshape(-1)
+        
+        # Compute Loss
+        loss = criterion(logits_flat[mask_flat], y_flat[mask_flat])
+        
+        # Scale loss by batch size for gradient accumulation
+        loss = loss / X_aug_batch.size(0)
+        
+        if not loss.requires_grad:
+             dummy = sum(p.sum() for p in model.adapter.parameters()) * 0.0
+             loss = loss + dummy
+             
+        loss.backward()
+        total_loss += loss.item()
 
-        z_support = X_full[:n_support]  # (n_support, D)
-        z_query_all = X_full[n_support:]  # (qry_len, D)
-        z_query = z_query_all[mask_in]
-        y_query = y_qry[mask_in]
-
-        if z_query.size(0) < 1:
-            continue
-
-        loss_i = icl_loss_fn.forward_episode(z_support, y_sup, z_query, y_query)
-        total_loss = total_loss + loss_i
-        used += 1
-
-    if used == 0:
-        return None
-
-    proto_loss_tensor = total_loss / used
-    loss = proto_loss_tensor
-
-    # Add causal auxiliary losses from StructuralCausalAdapter (averaged over datasets in meta-batch).
-    if len(indep_losses) > 0:
-        indep_mean_tensor = torch.stack(indep_losses).mean()
-        loss = loss + args.indep_weight * indep_mean_tensor
-    else:
-        indep_mean_tensor = torch.tensor(0.0, device=proto_loss_tensor.device)
-    # if len(sparse_losses) > 0:
-    #     sparse_mean_tensor = torch.stack(sparse_losses).mean()
-    #     loss = loss + args.sparsity_weight * sparse_mean_tensor
-    # else:
-    #     sparse_mean_tensor = torch.tensor(0.0, device=proto_loss_tensor.device)
-
-    loss.backward()  
-    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # 防止梯度爆炸
-    # 打印日志时，分别打印 cls 和 kl，看看是谁在捣乱
     optimizer.step()
-    return {
-        "loss": float(loss.detach().item()),
-        "proto_loss": float(proto_loss_tensor.detach().item()),
-        "independence_loss": float(indep_mean_tensor.detach().item()),
-        #"sparsity_loss": float(sparse_mean_tensor.detach().item()),
-    }
+    
+    return total_loss
 
 def main():
     parser = argparse.ArgumentParser()
@@ -491,7 +427,7 @@ def main():
     parser.add_argument("--mantis_ckpt", type=str, default="/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint/")
     parser.add_argument("--uea_path", type=str, default="/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UEAData/")
     parser.add_argument("--ucr_path", type=str, default="/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UCRdata/")
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--epochs", type=int, default=3)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--div_weight", type=float, default=0.1)
     parser.add_argument("--max_icl_len", type=int, default=512, help="Max sequence length for ICL training to avoid OOM")
@@ -503,21 +439,6 @@ def main():
     parser.add_argument("--output_file", type=str, default=None, help="Path to save results JSON")
     parser.add_argument("--seed", type=int, default=666, help="Random seed for reproducibility")
     parser.add_argument("--n_augmentations", type=int, default=5, help="Number of augmentations per dataset")
-    parser.add_argument("--num_latents", type=int, default=10, help="Number of causal latents extracted by cross-attention")
-    parser.add_argument("--num_heads", type=int, default=4, help="Number of attention heads in the adapter")
-    parser.add_argument("--adapter_norm", type=str, default="bn", choices=["bn", "ln", "none"], help="Normalization for adapter outputs")
-    parser.add_argument("--kl_weight", type=float, default=1e-3, help="KL regularization weight toward N(0, I)")
-
-    # StructuralCausalAdapter hyperparams
-    parser.add_argument("--independence", type=str, default="orth", choices=["orth", "hsic"], help="Independence regularizer among K latents")
-    parser.add_argument("--hsic_kernel", type=str, default="rbf", choices=["rbf", "linear"], help="HSIC kernel type (if independence=hsic)")
-    parser.add_argument("--hsic_sigma", type=float, default=1.0, help="RBF sigma for HSIC (if independence=hsic)")
-    parser.add_argument("--gumbel_tau", type=float, default=1.0, help="Gumbel-Sigmoid temperature for adjacency sampling")
-    parser.add_argument("--gumbel_hard", action="store_true", help="Use hard (straight-through) adjacency sampling")
-    parser.add_argument("--allow_self_edges", action="store_true", help="Allow self edges in adjacency matrix")
-    parser.add_argument("--sparsity_on", type=str, default="prob", choices=["prob", "sample"], help="Apply sparsity loss on prob or sampled adjacency")
-    parser.add_argument("--indep_weight", type=float, default=1e-2, help="Weight for independence_loss")
-    parser.add_argument("--sparsity_weight", type=float, default=1e-3, help="Weight for sparsity_loss")
     
     args = parser.parse_args()
     
@@ -546,32 +467,10 @@ def main():
     
     if args.no_adapter:
         adapter = None
-        projector = None
     else:
-        adapter = StructuralCausalAdapter(
-            emb_dim=mantis_dim,
-            num_latents=args.num_latents,
-            num_heads=args.num_heads,
-            dropout=0.0,
-            norm=args.adapter_norm,
-            use_affine_norm=False,
-            independence=args.independence,
-            hsic_kernel=args.hsic_kernel,
-            hsic_sigma=args.hsic_sigma,
-            gumbel_tau=args.gumbel_tau,
-            gumbel_hard=args.gumbel_hard,
-            allow_self_edges=args.allow_self_edges,
-            sparsity_on=args.sparsity_on,
-        ).to(device)
-        projector = nn.Linear(args.num_latents * mantis_dim, tabicl_dim).to(device)
-
-    model = MantisAdapterTabICL(
-        mantis_model,
-        tabicl_model,
-        adapter,
-        projector=projector,
-        mantis_batch_size=args.mantis_batch_size,
-    ).to(device)
+        adapter = CALDA_Adapter(mantis_emb_dim=mantis_dim, tabicl_input_dim=tabicl_dim).to(device)
+    
+    model = MantisAdapterTabICL(mantis_model, tabicl_model, adapter, mantis_batch_size=args.mantis_batch_size).to(device)
     
     reader = DataReader(UEA_data_path=args.uea_path, UCR_data_path=args.ucr_path)
     
@@ -581,12 +480,8 @@ def main():
     # --- Pretraining Phase ---
     if not args.no_adapter:
         print(f"Starting Pretraining on {len(datasets)} datasets for {args.epochs} epochs...")
-        optimizer = optim.AdamW(
-            list(model.adapter.parameters()) + list(model.projector.parameters()),
-            lr=args.lr,
-            weight_decay=1e-4,
-        )
-        icl_loss_fn = ICLAlignmentLoss(n_support=128, kl_weight=args.kl_weight).to(device)
+        optimizer = optim.AdamW(model.adapter.parameters(), lr=args.lr, weight_decay=1e-4)
+        criterion = nn.CrossEntropyLoss()
         
         for epoch in range(args.epochs):
             random.shuffle(datasets)
@@ -610,25 +505,10 @@ def main():
                     continue
                 
                 try:
-                    metrics = train_step(model, optimizer, icl_loss_fn, batch_data, device, args)
-                    if metrics is None:
-                        continue
-                    epoch_loss += metrics["loss"]
+                    loss = train_step(model, optimizer, criterion, batch_data, device, args)
+                    epoch_loss += loss
                     count += 1
-
-                    # Track running means for easy ablation screenshots.
-                    if count == 1:
-                        run_indep = metrics["independence_loss"]
-                        #run_sparse = metrics["sparsity_loss"]
-                    else:
-                        run_indep = run_indep + metrics["independence_loss"]
-                        #run_sparse = run_sparse + metrics["sparsity_loss"]
-
-                    pbar.set_postfix({
-                        'avg_loss': epoch_loss / count if count > 0 else 0,
-                        'avg_indep': run_indep / count if count > 0 else 0,
-                        #'avg_sparse': run_sparse / count if count > 0 else 0,
-                    })
+                    pbar.set_postfix({'avg_loss': epoch_loss / count if count > 0 else 0})
                 except RuntimeError as e:
                     if "out of memory" in str(e):
                         print(f"\nSkipping batch due to OOM")
@@ -713,7 +593,6 @@ def main():
         with open(args.output_file, 'w') as f:
             json.dump(structured_results, f, indent=4)
         print(f"Results saved to {args.output_file}")
-
 
 if __name__ == "__main__":
     main()
