@@ -19,6 +19,7 @@ from tabicl.model.adapterOrign import CALDA_Adapter, DistributionDiversityLoss
 from tabicl.prior.data_reader import DataReader
 from tabicl.model.tabicl import TabICL
 from tabicl.sklearn.classifier import TabICLClassifier
+from tabicl.model.mantis_dev.adapters import VarianceBasedSelector
 
 def load_dataset_names_from_file(filepath):
     """从结果文件读取所有数据集名称（每行格式：name: acc）"""
@@ -60,13 +61,57 @@ def resize_series(X, target_len=512):
     X_resized = torch.nn.functional.interpolate(X_tensor, size=target_len, mode='linear', align_corners=False)
     return X_resized
 
+
+def _maybe_select_channels_uea(
+    X_train_raw,
+    X_test_raw,
+    *,
+    enabled: bool,
+    new_num_channels: int | None,
+    dataset_name: str | None = None,
+):
+    """Apply VarianceBasedSelector on UEA multichannel time series.
+
+    Fit selector on training split only, then transform train/test.
+    Expects input in (N, C, L) (or will be coerced by _ensure_three_dim).
+    """
+    if not enabled:
+        return X_train_raw, X_test_raw
+    if new_num_channels is None:
+        return X_train_raw, X_test_raw
+
+    X_train_np = _ensure_three_dim(X_train_raw)
+    X_test_np = _ensure_three_dim(X_test_raw)
+
+    if X_train_np.ndim != 3:
+        return X_train_raw, X_test_raw
+
+    _, c_train, _ = X_train_np.shape
+    if c_train <= 1:
+        return X_train_np, X_test_np
+
+    k = int(new_num_channels)
+    k = max(1, min(k, c_train))
+    if k == c_train:
+        return X_train_np, X_test_np
+
+    if dataset_name is not None:
+        print(f"[VarSelector][UEA] {dataset_name}: channels {c_train} -> {k}")
+
+    selector = VarianceBasedSelector(k)
+    selector.fit(X_train_np)
+    X_train_sel = selector.transform(X_train_np)
+    X_test_sel = selector.transform(X_test_np)
+    return X_train_sel, X_test_sel
+
 class MantisAdapterTabICL(nn.Module):
-    def __init__(self, mantis_model, tabicl_model, adapter, mantis_batch_size=16):
+    def __init__(self, mantis_model, tabicl_model, adapter, mantis_batch_size=16, mantis_fusion: str = "concat"):
         super().__init__()
         self.mantis_model = mantis_model
         self.tabicl_model = tabicl_model
         self.adapter = adapter
         self.mantis_batch_size = mantis_batch_size
+        self.mantis_fusion = mantis_fusion
         
         # Freeze Mantis and TabICL
         for param in self.mantis_model.parameters():
@@ -107,18 +152,23 @@ class MantisAdapterTabICL(nn.Module):
             
         # 2. Adapter
         mantis_out_reshaped = mantis_out.reshape(B*N, C, -1)
-        
-        if self.adapter is not None:
-            # Batch execution for Adapter
-            adapter_outs = []
-            adapter_batch_size = 32
-            for i in range(0, mantis_out_reshaped.size(0), adapter_batch_size):
-                batch_slice = mantis_out_reshaped[i : i + adapter_batch_size]
-                out_slice = self.adapter(batch_slice)
-                adapter_outs.append(out_slice)
-            adapter_out = torch.cat(adapter_outs, dim=0)
+
+        # v2: fuse multichannel representations by elementwise sum (instead of concat)
+        if self.mantis_fusion == "sum":
+            adapter_out = mantis_out_reshaped.sum(dim=1)
         else:
-            adapter_out = mantis_out_reshaped.reshape(B*N, -1)
+            if self.adapter is not None:
+                # Batch execution for Adapter
+                adapter_outs = []
+                adapter_batch_size = 32
+                for i in range(0, mantis_out_reshaped.size(0), adapter_batch_size):
+                    batch_slice = mantis_out_reshaped[i : i + adapter_batch_size]
+                    out_slice = self.adapter(batch_slice)
+                    adapter_outs.append(out_slice)
+                adapter_out = torch.cat(adapter_outs, dim=0)
+            else:
+                # concat/flatten over channels
+                adapter_out = mantis_out_reshaped.reshape(B*N, -1)
         
         # 3. TabICL
         tabicl_in = adapter_out.reshape(B, N, -1)
@@ -153,19 +203,24 @@ class MantisAdapterTabICL(nn.Module):
             mantis_out = torch.cat(mantis_outs, dim=0)
             
         # 2. Adapter
-        mantis_out_reshaped = mantis_out.reshape(B*N, C, -1)
-        
-        if self.adapter is not None:
-            # Batch execution for Adapter
-            adapter_outs = []
-            adapter_batch_size = 32
-            for i in range(0, mantis_out_reshaped.size(0), adapter_batch_size):
-                batch_slice = mantis_out_reshaped[i : i + adapter_batch_size]
-                out_slice = self.adapter(batch_slice)
-                adapter_outs.append(out_slice)
-            adapter_out = torch.cat(adapter_outs, dim=0)
+        mantis_out_reshaped = mantis_out.reshape(B*N, C, -1 ) # B=1
+
+        # v2: fuse multichannel representations by elementwise sum (instead of concat)
+        if self.mantis_fusion == "sum":
+            adapter_out = mantis_out_reshaped.sum(dim=1)
         else:
-            adapter_out = mantis_out_reshaped.reshape(B*N, -1)
+            if self.adapter is not None:
+                # Batch execution for Adapter
+                adapter_outs = []
+                adapter_batch_size = 32
+                for i in range(0, mantis_out_reshaped.size(0), adapter_batch_size):
+                    batch_slice = mantis_out_reshaped[i : i + adapter_batch_size]
+                    out_slice = self.adapter(batch_slice)
+                    adapter_outs.append(out_slice)
+                adapter_out = torch.cat(adapter_outs, dim=0)
+            else:
+                # concat/flatten over channels
+                adapter_out = mantis_out_reshaped.reshape(B*N, -1)
             
         return adapter_out.reshape(B, N, -1)
 
@@ -225,24 +280,37 @@ def get_embeddings(model, X_data, device, batch_size=64):
                 mantis_outs.append(model.mantis_model(sub_batch))
             mantis_out = torch.cat(mantis_outs, dim=0) # (B*C, Mantis_Dim)
             
-            # Adapter
+            # Fuse channels / Adapter
             mantis_out_reshaped = mantis_out.reshape(B, C, -1)
-            if model.adapter is not None:
-                adapter_out = model.adapter(mantis_out_reshaped) # (B, TabICL_Dim)
+            if getattr(model, "mantis_fusion", "concat") == "sum":
+                adapter_out = mantis_out_reshaped.sum(dim=1)  # (B, Mantis_Dim)
             else:
-                adapter_out = mantis_out_reshaped.reshape(B, -1)
+                if model.adapter is not None:
+                    adapter_out = model.adapter(mantis_out_reshaped) # (B, TabICL_Dim)
+                else:
+                    adapter_out = mantis_out_reshaped.reshape(B, -1)
                 
             embs.append(adapter_out.cpu().numpy())
             
     return np.concatenate(embs, axis=0)
 
-def load_dataset_data(reader, dataset_name):
+def load_dataset_data(reader, dataset_name, *, is_uea: bool, use_var_selector: bool, var_num_channels: int | None):
     try:
         X_train_raw, y_train_raw = reader.read_dataset(dataset_name, which_set="train")
         X_test_raw, y_test_raw = reader.read_dataset(dataset_name, which_set="test")
     except Exception as e:
         print(f"Error loading {dataset_name}: {e}")
         return None, None, None, None
+
+    # UEA: optional variance-based channel compression (UCR stays unchanged)
+    if is_uea:
+        X_train_raw, X_test_raw = _maybe_select_channels_uea(
+            X_train_raw,
+            X_test_raw,
+            enabled=use_var_selector,
+            new_num_channels=var_num_channels,
+            dataset_name=dataset_name,
+        )
 
     X_train = _ensure_three_dim(X_train_raw)
     X_test = _ensure_three_dim(X_test_raw)
@@ -255,171 +323,212 @@ def load_dataset_data(reader, dataset_name):
     
     return X_train, y_train, X_test, y_test
 
-def train_step(model, optimizer, criterion, batch_datasets, device, args):
-    model.train()
-    optimizer.zero_grad()
-    
-    # 1. Determine n_support (context size) for this batch
-    # Use args.train_size but capped by the smallest training set in the batch
+
+def _build_meta_tasks(model, batch_datasets, device, args):
+    """
+    Build augmented meta-learning tasks for adapter training/eval.
+
+    Returns:
+        X_aug_batch: (T, L, D)
+        y_sup_aug_batch: (T, n_support)
+        y_qry_aug_batch: (T, qry_len)
+        valid_mask_batch: (T, qry_len)
+        n_support: int
+        qry_len: int
+    """
+    # 1) Determine n_support (context size) for this batch
     min_train_len = min(d[0].size(0) for d in batch_datasets)
     n_support = min(args.train_size, min_train_len)
-    
-    # Ensure n_support is at least 1
     if n_support < 1:
-        return 0.0
+        return None
 
     X_seq_list = []
     y_sup_mapped_list = []
     y_qry_mapped_list = []
     valid_mask_list = []
-    
+
     for X_train, y_train, X_test, y_test in batch_datasets:
-        # Construct sequence
-        # Support: X_train[:n_support]
-        # Query: X_train[n_support:] + X_test
-        
         X_sup = X_train[:n_support]
         y_sup = y_train[:n_support]
-        
-        # Remaining training data + test data
+
         X_qry = torch.cat([X_train[n_support:], X_test], dim=0)
         y_qry = torch.cat([y_train[n_support:], y_test], dim=0)
-        
+
         X_seq = torch.cat([X_sup, X_qry], dim=0)
-        # y_seq is not strictly needed as one tensor, we process sup and qry separately for mapping
-        
         X_seq_list.append(X_seq)
-        
-        # Mapping (needed for TabICL/Loss)
-        # We map based on Support set classes
+
+        # Map classes based on support-set classes
         unique_classes, inverse_indices = torch.unique(y_sup, return_inverse=True)
         y_sup_mapped = inverse_indices.to(device)
-        
-        # Map query labels
+
         max_label = max(y_sup.max(), y_qry.max()).item()
         mapper = torch.full((max_label + 1,), -1, dtype=torch.long, device=device)
-        mapper[unique_classes] = torch.arange(len(unique_classes), device=device)
-        
+        mapper[unique_classes.to(device)] = torch.arange(len(unique_classes), device=device)
+
         y_qry_mapped = mapper[y_qry.to(device)]
         valid_mask = (y_qry_mapped != -1)
-        
+
         # Safe mapping for augmentation (replace -1 with 0)
         y_qry_mapped_safe = y_qry_mapped.clone()
         y_qry_mapped_safe[~valid_mask] = 0
-        
+
         y_sup_mapped_list.append(y_sup_mapped)
         y_qry_mapped_list.append(y_qry_mapped_safe)
         valid_mask_list.append(valid_mask)
 
-    # 2. Collate (Truncate to min length in batch, and max_icl_len)
+    # 2) Collate: truncate to min length in batch and args.max_icl_len
     min_len = min(x.size(0) for x in X_seq_list)
     target_len = min(min_len, args.max_icl_len)
-    
-    # Ensure target_len > n_support (so we have at least some query samples)
     if target_len <= n_support:
-        return 0.0
+        return None
 
     adapter_out_list = []
     y_sup_batch_list = []
     y_qry_batch_list = []
     mask_batch_list = []
-    
+
     for i in range(len(batch_datasets)):
-        # Truncate X and get embeddings individually to handle variable channels
         x_item = X_seq_list[i][:target_len]
-        emb = model.get_adapter_output(x_item.unsqueeze(0)) # (1, L, D)
+        emb = model.get_adapter_output(x_item.unsqueeze(0))  # (1, L, D)
         adapter_out_list.append(emb.squeeze(0))
 
-        # y_sup is fixed size n_support
         y_sup_batch_list.append(y_sup_mapped_list[i])
-        
-        # y_qry needs to be truncated. 
-        # The query part starts at n_support.
-        # Total length is target_len.
-        # So query length is target_len - n_support.
+
         qry_len = target_len - n_support
         y_qry_batch_list.append(y_qry_mapped_list[i][:qry_len])
         mask_batch_list.append(valid_mask_list[i][:qry_len])
 
-    adapter_out = torch.stack(adapter_out_list) # (B, L, D)
-    
-    # Augmentation loop
+    adapter_out = torch.stack(adapter_out_list)  # (B, L, D)
+
+    # 3) Augment
     aug_emb_list = []
     aug_y_sup_list = []
     aug_y_qry_list = []
     aug_mask_list = []
-    
+
     for i in range(len(batch_datasets)):
-        emb = adapter_out[i].unsqueeze(0) # (1, L, D)
-        y_sup = y_sup_batch_list[i].unsqueeze(0) # (1, n_support)
-        y_qry = y_qry_batch_list[i].unsqueeze(0) # (1, qry_len)
+        emb = adapter_out[i].unsqueeze(0)  # (1, L, D)
+        y_sup = y_sup_batch_list[i].unsqueeze(0)  # (1, n_support)
+        y_qry = y_qry_batch_list[i].unsqueeze(0)  # (1, qry_len)
         mask = mask_batch_list[i]
-        
-        # Determine n_classes for this task
+
         n_classes = y_sup.max().item() + 1
-        
-        # Multiple augmentations
+        # Handle degenerate tasks
+        if n_classes < 1:
+            continue
+
         for _ in range(args.n_augmentations):
-            X_aug, y_sup_aug, y_qry_aug = augment_batch(
-                emb, y_sup, y_qry, device, n_classes
-            )
-            
+            X_aug, y_sup_aug, y_qry_aug = augment_batch(emb, y_sup, y_qry, device, n_classes)
             aug_emb_list.append(X_aug.squeeze(0))
             aug_y_sup_list.append(y_sup_aug.squeeze(0))
             aug_y_qry_list.append(y_qry_aug.squeeze(0))
             aug_mask_list.append(mask)
-        
+
+    if not aug_emb_list:
+        return None
+
     X_aug_batch = torch.stack(aug_emb_list)
     y_sup_aug_batch = torch.stack(aug_y_sup_list)
     y_qry_aug_batch = torch.stack(aug_y_qry_list)
     valid_mask_batch = torch.stack(aug_mask_list)
-    
-    # Forward
-    # We process tasks individually to avoid "same number of classes" error in TabICL
+
+    qry_len = y_qry_aug_batch.size(1)
+    return X_aug_batch, y_sup_aug_batch, y_qry_aug_batch, valid_mask_batch, n_support, qry_len
+
+
+def _compute_meta_loss(model, criterion, X_aug_batch, y_sup_aug_batch, y_qry_aug_batch, valid_mask_batch):
+    """Compute averaged meta loss across tasks in X_aug_batch."""
     total_loss = 0.0
-    
+    denom = 0
+
     for i in range(X_aug_batch.size(0)):
-        # Slice for single task
-        X_in = X_aug_batch[i].unsqueeze(0) # (1, L, D)
-        y_sup_in = y_sup_aug_batch[i].unsqueeze(0) # (1, n_support)
-        y_qry_in = y_qry_aug_batch[i].unsqueeze(0) # (1, qry_len)
-        mask_in = valid_mask_batch[i] # (qry_len,)
-        
+        X_in = X_aug_batch[i].unsqueeze(0)  # (1, L, D)
+        y_sup_in = y_sup_aug_batch[i].unsqueeze(0)  # (1, n_support)
+        y_qry_in = y_qry_aug_batch[i].unsqueeze(0)  # (1, qry_len)
+        mask_in = valid_mask_batch[i]  # (qry_len,)
+
         if not mask_in.any():
             continue
-            
-        # Forward TabICL (Batch size = 1)
+
         logits = model.tabicl_model(X_in, y_sup_in, return_logits=True)
-        
-        # Handle logits shape
-        # If logits corresponds to full sequence, take the query part (last qry_len)
+
         qry_len = y_qry_in.size(1)
         if logits.size(1) == X_in.size(1):
-             logits_qry = logits[:, -qry_len:, :]
+            logits_qry = logits[:, -qry_len:, :]
         else:
-             logits_qry = logits
-             
-        # Flatten
+            logits_qry = logits
+
         logits_flat = logits_qry.reshape(-1, logits_qry.size(-1))
         y_flat = y_qry_in.reshape(-1)
         mask_flat = mask_in.reshape(-1)
-        
-        # Compute Loss
+
         loss = criterion(logits_flat[mask_flat], y_flat[mask_flat])
-        
-        # Scale loss by batch size for gradient accumulation
+        total_loss += loss.item()
+        denom += 1
+
+    if denom == 0:
+        return None
+    return total_loss / denom
+
+
+def train_step(model, optimizer, criterion, batch_datasets, device, args):
+    model.train()
+    optimizer.zero_grad()
+
+    built = _build_meta_tasks(model, batch_datasets, device, args)
+    if built is None:
+        return 0.0
+    X_aug_batch, y_sup_aug_batch, y_qry_aug_batch, valid_mask_batch, _, _ = built
+
+    # Forward/backward across tasks (manual to keep per-task class counts independent)
+    total_loss = 0.0
+    denom = 0
+
+    for i in range(X_aug_batch.size(0)):
+        X_in = X_aug_batch[i].unsqueeze(0)
+        y_sup_in = y_sup_aug_batch[i].unsqueeze(0)
+        y_qry_in = y_qry_aug_batch[i].unsqueeze(0)
+        mask_in = valid_mask_batch[i]
+
+        if not mask_in.any():
+            continue
+
+        logits = model.tabicl_model(X_in, y_sup_in, return_logits=True)
+
+        qry_len = y_qry_in.size(1)
+        if logits.size(1) == X_in.size(1):
+            logits_qry = logits[:, -qry_len:, :]
+        else:
+            logits_qry = logits
+
+        logits_flat = logits_qry.reshape(-1, logits_qry.size(-1))
+        y_flat = y_qry_in.reshape(-1)
+        mask_flat = mask_in.reshape(-1)
+
+        loss = criterion(logits_flat[mask_flat], y_flat[mask_flat])
         loss = loss / X_aug_batch.size(0)
-        
+
+        # Ensure graph exists even if something odd happens
         if not loss.requires_grad:
-             dummy = sum(p.sum() for p in model.adapter.parameters()) * 0.0
-             loss = loss + dummy
-             
+            dummy = sum(p.sum() for p in model.adapter.parameters()) * 0.0
+            loss = loss + dummy
+
         loss.backward()
         total_loss += loss.item()
+        denom += 1
 
     optimizer.step()
-    
-    return total_loss
+    return total_loss if denom > 0 else 0.0
+
+
+@torch.no_grad()
+def validate_step(model, criterion, batch_datasets, device, args):
+    model.eval()
+    built = _build_meta_tasks(model, batch_datasets, device, args)
+    if built is None:
+        return None
+    X_aug_batch, y_sup_aug_batch, y_qry_aug_batch, valid_mask_batch, _, _ = built
+    return _compute_meta_loss(model, criterion, X_aug_batch, y_sup_aug_batch, y_qry_aug_batch, valid_mask_batch)
 
 def main():
     parser = argparse.ArgumentParser()
@@ -439,6 +548,40 @@ def main():
     parser.add_argument("--output_file", type=str, default=None, help="Path to save results JSON")
     parser.add_argument("--seed", type=int, default=666, help="Random seed for reproducibility")
     parser.add_argument("--n_augmentations", type=int, default=5, help="Number of augmentations per dataset")
+    parser.add_argument("--val_ratio", type=float, default=0.1, help="Validation ratio (held-out datasets) during adapter pretraining")
+    parser.add_argument("--ckpt_dir", type=str, default="/data0/fangjuntao2025/tabicl-main/checkpoints/mantis_adapter_pretrain", help="Directory to save adapter checkpoints")
+    parser.add_argument("--ckpt_prefix", type=str, default="adapter", help="Checkpoint filename prefix")
+    parser.add_argument("--save_last", action="store_true", help="Also save last checkpoint each epoch")
+
+    # v2: how to fuse multichannel Mantis representations before TabICL
+    parser.add_argument(
+        "--mantis_fusion",
+        type=str,
+        default="concat",
+        choices=["concat", "sum"],
+        help="How to fuse per-channel Mantis embeddings. 'concat' flattens channels; 'sum' adds them elementwise (v2).",
+    )
+
+    # Adapter checkpoint selection for evaluation
+    parser.add_argument(
+        "--eval_adapter_ckpt",
+        type=str,
+        default=None,
+        help="Path to an adapter checkpoint (.pt) to load for evaluation. If not set, auto-load best from ckpt_dir.",
+    )
+
+    # Variance-based channel selector (UEA only)
+    parser.add_argument(
+        "--use_var_selector",
+        action="store_true",
+        help="Enable VarianceBasedSelector channel compression for UEA datasets only (UCR unchanged).",
+    )
+    parser.add_argument(
+        "--var_num_channels",
+        type=int,
+        default=10,
+        help="Target number of channels after variance-based selection (UEA only).",
+    )
     
     args = parser.parse_args()
     
@@ -460,44 +603,80 @@ def main():
     tabicl_model.to(device)
     
     # Initialize Adapter
-    tabicl_dim = 64
+    tabicl_dim = 256
+    
     mantis_dim = mantis_model.hidden_dim
     
     print(f"Mantis Dim: {mantis_dim}, TabICL Dim: {tabicl_dim}")
     
+    # v2: sum-fusion is a non-parametric channel mixer; disable adapter training to match spec
+    if args.mantis_fusion == "sum":
+        if not args.no_adapter:
+            print("[Info] mantis_fusion='sum' (v2) -> forcing --no_adapter (no learnable adapter).")
+        args.no_adapter = True
+
     if args.no_adapter:
         adapter = None
     else:
         adapter = CALDA_Adapter(mantis_emb_dim=mantis_dim, tabicl_input_dim=tabicl_dim).to(device)
     
-    model = MantisAdapterTabICL(mantis_model, tabicl_model, adapter, mantis_batch_size=args.mantis_batch_size).to(device)
+    model = MantisAdapterTabICL(
+        mantis_model,
+        tabicl_model,
+        adapter,
+        mantis_batch_size=args.mantis_batch_size,
+        mantis_fusion=args.mantis_fusion,
+    ).to(device)
     
     reader = DataReader(UEA_data_path=args.uea_path, UCR_data_path=args.ucr_path)
     
     # Combine UCR and UEA datasets
-    datasets = sorted(reader.dataset_list_ucr)
+    datasets = sorted(reader.dataset_list_ucr+reader.dataset_list_uea)
+
+    # Split datasets into train/val for meta-pretraining
+    train_datasets = datasets
+    val_datasets = []
+    if not args.no_adapter and args.val_ratio > 0:
+        rng = random.Random(args.seed)
+        shuffled = datasets.copy()
+        rng.shuffle(shuffled)
+        val_count = max(1, int(len(shuffled) * args.val_ratio)) if len(shuffled) > 1 else 0
+        val_datasets = sorted(shuffled[:val_count])
+        train_datasets = sorted(shuffled[val_count:]) if val_count > 0 else datasets
+        print(f"Meta split: train={len(train_datasets)}, val={len(val_datasets)} (val_ratio={args.val_ratio})")
     
-    # --- Pretraining Phase ---
+    #--- Pretraining Phase ---
     if not args.no_adapter:
-        print(f"Starting Pretraining on {len(datasets)} datasets for {args.epochs} epochs...")
+        print(f"Starting Pretraining on {len(train_datasets)} datasets for {args.epochs} epochs...")
         optimizer = optim.AdamW(model.adapter.parameters(), lr=args.lr, weight_decay=1e-4)
         criterion = nn.CrossEntropyLoss()
+
+        os.makedirs(args.ckpt_dir, exist_ok=True)
+        best_val = float("inf")
+        best_epoch = -1
         
         for epoch in range(args.epochs):
-            random.shuffle(datasets)
+            random.shuffle(train_datasets)
             epoch_loss = 0.0
             count = 0
             
             # Create batches
-            num_batches = (len(datasets) + args.meta_batch_size - 1) // args.meta_batch_size
+            num_batches = (len(train_datasets) + args.meta_batch_size - 1) // args.meta_batch_size
             
             pbar = tqdm(range(num_batches), desc=f"Epoch {epoch+1}/{args.epochs}")
             for i in pbar:
-                batch_names = datasets[i*args.meta_batch_size : (i+1)*args.meta_batch_size]
+                batch_names = train_datasets[i*args.meta_batch_size : (i+1)*args.meta_batch_size]
                 
                 batch_data = []
                 for name in batch_names:
-                    X_tr, y_tr, X_te, y_te = load_dataset_data(reader, name)
+                    is_uea = name in reader.dataset_list_uea
+                    X_tr, y_tr, X_te, y_te = load_dataset_data(
+                        reader,
+                        name,
+                        is_uea=is_uea,
+                        use_var_selector=args.use_var_selector,
+                        var_num_channels=args.var_num_channels,
+                    )
                     if X_tr is not None:
                         batch_data.append((X_tr, y_tr, X_te, y_te))
                 
@@ -516,12 +695,111 @@ def main():
                         continue
                     else:
                         raise e
+
+            avg_train_loss = epoch_loss / count if count > 0 else 0.0
+
+            # Validation
+            avg_val_loss = None
+            if val_datasets:
+                val_loss_sum = 0.0
+                val_steps = 0
+                num_val_batches = (len(val_datasets) + args.meta_batch_size - 1) // args.meta_batch_size
+                for i in tqdm(range(num_val_batches), desc=f"Val {epoch+1}/{args.epochs}", leave=False):
+                    batch_names = val_datasets[i*args.meta_batch_size : (i+1)*args.meta_batch_size]
+                    batch_data = []
+                    for name in batch_names:
+                        is_uea = name in reader.dataset_list_uea
+                        X_tr, y_tr, X_te, y_te = load_dataset_data(
+                            reader,
+                            name,
+                            is_uea=is_uea,
+                            use_var_selector=args.use_var_selector,
+                            var_num_channels=args.var_num_channels,
+                        )
+                        if X_tr is not None:
+                            batch_data.append((X_tr, y_tr, X_te, y_te))
+                    if not batch_data:
+                        continue
+                    try:
+                        vloss = validate_step(model, criterion, batch_data, device, args)
+                        if vloss is None:
+                            continue
+                        val_loss_sum += vloss
+                        val_steps += 1
+                    except RuntimeError as e:
+                        if "out of memory" in str(e):
+                            torch.cuda.empty_cache()
+                            continue
+                        raise e
+                avg_val_loss = val_loss_sum / val_steps if val_steps > 0 else None
+
+            # Save checkpoints
+            ckpt_common = {
+                "epoch": epoch,
+                "adapter_state_dict": copy.deepcopy(model.adapter.state_dict()),
+                "optimizer_state_dict": copy.deepcopy(optimizer.state_dict()),
+                "train_loss": avg_train_loss,
+                "val_loss": avg_val_loss,
+                "best_val_loss": best_val,
+                "best_epoch": best_epoch,
+                "config": vars(args),
+                "tabicl_ckpt": args.tabicl_ckpt,
+                "mantis_ckpt": args.mantis_ckpt,
+                "seed": args.seed,
+            }
+
+            if args.save_last:
+                last_path = os.path.join(args.ckpt_dir, f"{args.ckpt_prefix}_last.pt")
+                torch.save(ckpt_common, last_path)
+
+            if avg_val_loss is not None and avg_val_loss < best_val:
+                best_val = avg_val_loss
+                best_epoch = epoch
+                best_path = os.path.join(args.ckpt_dir, f"{args.ckpt_prefix}_best.pt")
+                ckpt_best = dict(ckpt_common)
+                ckpt_best["best_val_loss"] = best_val
+                ckpt_best["best_epoch"] = best_epoch
+                torch.save(ckpt_best, best_path)
+                print(f"Saved best checkpoint: {best_path} (val_loss={best_val:.6f})")
+            elif not val_datasets:
+                # If no validation, save best by train loss
+                train_path = os.path.join(args.ckpt_dir, f"{args.ckpt_prefix}_best_trainloss.pt")
+                torch.save(ckpt_common, train_path)
+                print(f"Saved checkpoint (no val): {train_path} (train_loss={avg_train_loss:.6f})")
+            else:
+                if avg_val_loss is not None:
+                    print(f"Epoch {epoch+1}: train_loss={avg_train_loss:.6f}, val_loss={avg_val_loss:.6f}, best_val={best_val:.6f}")
+                else:
+                    print(f"Epoch {epoch+1}: train_loss={avg_train_loss:.6f}, val_loss=N/A, best_val={best_val:.6f}")
         
         print("Pretraining finished.")
     
     # --- Evaluation Phase ---
     print("Starting Evaluation...")
     results = {}
+
+    # Load best adapter weights for evaluation (if adapter is enabled)
+    if (not args.no_adapter) and (model.adapter is not None):
+        ckpt_to_load = None
+        if args.eval_adapter_ckpt:
+            ckpt_to_load = args.eval_adapter_ckpt
+        else:
+            best_path = os.path.join(args.ckpt_dir, f"{args.ckpt_prefix}_best.pt")
+            best_trainloss_path = os.path.join(args.ckpt_dir, f"{args.ckpt_prefix}_best_trainloss.pt")
+            last_path = os.path.join(args.ckpt_dir, f"{args.ckpt_prefix}_last.pt")
+            for p in (best_path, best_trainloss_path, last_path):
+                if os.path.isfile(p):
+                    ckpt_to_load = p
+                    break
+
+        if ckpt_to_load is not None and os.path.isfile(ckpt_to_load):
+            ckpt = torch.load(ckpt_to_load, map_location="cpu")
+            adapter_state = ckpt.get("adapter_state_dict", ckpt)
+            model.adapter.load_state_dict(adapter_state)
+            model.adapter.to(device)
+            print(f"[Eval] Loaded adapter weights: {ckpt_to_load}")
+        else:
+            print("[Eval] No adapter checkpoint found; using current adapter weights.")
     
     # Initialize Classifier for evaluation
     clf = TabICLClassifier(
@@ -536,7 +814,14 @@ def main():
     all_datasets = sorted(reader.dataset_list_ucr + reader.dataset_list_uea)
     for dataset_name in tqdm(all_datasets, desc="Evaluating"):
         try:
-            X_train, y_train, X_test, y_test = load_dataset_data(reader, dataset_name)
+            is_uea = dataset_name in reader.dataset_list_uea
+            X_train, y_train, X_test, y_test = load_dataset_data(
+                reader,
+                dataset_name,
+                is_uea=is_uea,
+                use_var_selector=args.use_var_selector,
+                var_num_channels=args.var_num_channels,
+            )
             if X_train is None:
                 continue
                 
