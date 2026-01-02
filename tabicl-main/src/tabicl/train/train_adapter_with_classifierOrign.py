@@ -1,3 +1,6 @@
+#关闭推理时 D 维置乱：python [train_adapter_with_classifierOrign.py](http://_vscodecontentref_/13) --infer_no_feat_shuffle
+# 训练/预训练阶段关闭 D 维置乱：加 --train_no_feat_perm
+# 推理阶段关闭 D 维置乱（TabICLClassifier 侧）：仍用你已有的 --infer_no_feat_shuffle
 import argparse
 import os
 import sys
@@ -15,7 +18,7 @@ import copy
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../"))
 
 from tabicl.model.mantis_tabicl import MantisTabICL, build_mantis_encoder
-from tabicl.model.adapterOrign import CALDA_Adapter, DistributionDiversityLoss
+from tabicl.model.adapterOrign import CALDA_Adapter, DistributionDiversityLoss,ChannelMLPConcatAdapter, SafeResidualAdapter
 from tabicl.prior.data_reader import DataReader
 from tabicl.model.tabicl import TabICL
 from tabicl.sklearn.classifier import TabICLClassifier
@@ -224,34 +227,114 @@ class MantisAdapterTabICL(nn.Module):
             
         return adapter_out.reshape(B, N, -1)
 
-def augment_batch(X, y_support, y_query, device, n_classes):
+def augment_batch(X, y_support, y_query, device, n_classes, *, enable_feat_perm: bool = True):
+    """Apply TabICLClassifier-like augmentations and return augmentation metadata.
+
+    Augmentations:
+    1) Normalization (random, per-batch)
+    2) Feature shuffling (permute feature dimension)
+    3) Class shift (cyclic label shift)
+
+    Returns:
+        X_aug: (B, L, D)
+        y_support_aug: (B, n_support)
+        y_query_aug: (B, qry_len)
+        perm: (D,) LongTensor feature permutation indices
+        shift: int class shift offset
+        norm_applied: bool
     """
-    Apply TabICLClassifier-like augmentations:
-    1. Normalization (StandardScaler as proxy for PowerTransform)
-    2. Feature Shuffling
-    3. Class Shift
-    """
-    # X: (B, N_total, D)
-    # y_support: (B, N_support)
-    # y_query: (B, N_query)
-    
-    # 1. Normalization (Randomly apply)
-    if torch.rand(1).item() > 0.5:
+    # X: (B, L, D)
+    # y_support: (B, n_support)
+    # y_query: (B, qry_len)
+
+    norm_applied = bool(torch.rand(1).item() > 0.5)
+    if norm_applied:
         mean = X.mean(dim=1, keepdim=True)
         std = X.std(dim=1, keepdim=True) + 1e-5
         X = (X - mean) / std
-    
-    # 2. Feature Shuffling
+
     D = X.shape[-1]
-    perm = torch.randperm(D, device=device)
-    X = X[..., perm]
-    
-    # 3. Class Shift
-    shift = torch.randint(0, n_classes, (1,)).item()
+    if enable_feat_perm:
+        perm = torch.randperm(D, device=device)
+        X = X[..., perm]
+    else:
+        perm = torch.arange(D, device=device)
+
+    shift = int(torch.randint(0, n_classes, (1,), device=device).item())
     y_support = (y_support + shift) % n_classes
     y_query = (y_query + shift) % n_classes
-    
-    return X, y_support, y_query
+
+    return X, y_support, y_query, perm, shift, norm_applied
+
+
+def build_views(
+    emb: torch.Tensor,
+    y_sup: torch.Tensor,
+    y_qry: torch.Tensor,
+    mask: torch.Tensor,
+    n_classes: int,
+    K: int,
+    *,
+    device: torch.device,
+    enable_feat_perm: bool = True,
+):
+    """Build K augmented views for one task.
+
+    Args:
+        emb: (L, D) or (1, L, D)
+        y_sup: (n_support,) or (1, n_support)
+        y_qry: (qry_len,) or (1, qry_len)
+        mask: (qry_len,) boolean mask (kept unchanged)
+        n_classes: number of classes in this task
+        K: number of views
+
+    Returns:
+        X_views: (K, L, D)
+        y_sup_views: (K, n_support)
+        y_qry_views: (K, qry_len)
+        shifts: (K,) LongTensor
+        mask: (qry_len,) boolean mask (same as input)
+    """
+    if emb.dim() == 2:
+        emb_b = emb.unsqueeze(0)
+    else:
+        emb_b = emb
+
+    if y_sup.dim() == 1:
+        y_sup_b = y_sup.unsqueeze(0)
+    else:
+        y_sup_b = y_sup
+
+    if y_qry.dim() == 1:
+        y_qry_b = y_qry.unsqueeze(0)
+    else:
+        y_qry_b = y_qry
+
+    X_list = []
+    ysup_list = []
+    yqry_list = []
+    shifts_list = []
+
+    for _ in range(int(K)):
+        X_aug, y_sup_aug, y_qry_aug, _perm, shift, _norm_applied = augment_batch(
+            emb_b,
+            y_sup_b,
+            y_qry_b,
+            device,
+            n_classes,
+            enable_feat_perm=enable_feat_perm,
+        )
+        X_list.append(X_aug.squeeze(0))
+        ysup_list.append(y_sup_aug.squeeze(0))
+        yqry_list.append(y_qry_aug.squeeze(0))
+        shifts_list.append(int(shift))
+
+    X_views = torch.stack(X_list, dim=0)
+    y_sup_views = torch.stack(ysup_list, dim=0)
+    y_qry_views = torch.stack(yqry_list, dim=0)
+    shifts = torch.tensor(shifts_list, dtype=torch.long, device=X_views.device)
+
+    return X_views, y_sup_views, y_qry_views, shifts, mask
 
 
 def get_embeddings(model, X_data, device, batch_size=64):
@@ -324,6 +407,52 @@ def load_dataset_data(reader, dataset_name, *, is_uea: bool, use_var_selector: b
     return X_train, y_train, X_test, y_test
 
 
+def _sample_support_indices_stratified(y_train: torch.Tensor, n_support: int) -> torch.Tensor:
+    """Sample support indices from training labels.
+
+    - Randomly samples n_support indices.
+    - Prefer stratified coverage: try to include as many unique classes as possible.
+
+    Returns a 1D LongTensor of shape (n_support,).
+    """
+    if not isinstance(y_train, torch.Tensor):
+        y_train = torch.as_tensor(y_train)
+    y_train = y_train.detach().cpu().long()
+
+    n_train = int(y_train.numel())
+    if n_support >= n_train:
+        return torch.arange(n_train, dtype=torch.long)
+
+    # Try to take at least one sample per class (up to n_support)
+    classes = torch.unique(y_train)
+    if classes.numel() == 0:
+        return torch.randperm(n_train)[:n_support]
+
+    classes = classes[torch.randperm(classes.numel())]
+    chosen = []
+
+    for cls in classes.tolist():
+        idxs = torch.nonzero(y_train == int(cls), as_tuple=False).flatten()
+        if idxs.numel() == 0:
+            continue
+        pick = idxs[torch.randint(0, idxs.numel(), (1,)).item()]
+        chosen.append(int(pick.item()))
+        if len(chosen) >= n_support:
+            break
+
+    chosen_idx = torch.tensor(chosen, dtype=torch.long)
+    if chosen_idx.numel() < n_support:
+        mask = torch.ones(n_train, dtype=torch.bool)
+        mask[chosen_idx] = False
+        remaining = torch.nonzero(mask, as_tuple=False).flatten()
+        extra = remaining[torch.randperm(remaining.numel())[: (n_support - chosen_idx.numel())]]
+        chosen_idx = torch.cat([chosen_idx, extra], dim=0)
+
+    # Shuffle support order
+    chosen_idx = chosen_idx[torch.randperm(chosen_idx.numel())]
+    return chosen_idx
+
+
 def _build_meta_tasks(model, batch_datasets, device, args):
     """
     Build augmented meta-learning tasks for adapter training/eval.
@@ -348,11 +477,17 @@ def _build_meta_tasks(model, batch_datasets, device, args):
     valid_mask_list = []
 
     for X_train, y_train, X_test, y_test in batch_datasets:
-        X_sup = X_train[:n_support]
-        y_sup = y_train[:n_support]
+        # Random (preferably stratified) episodic support selection
+        support_idx = _sample_support_indices_stratified(y_train, n_support)
+        support_mask = torch.ones(y_train.size(0), dtype=torch.bool)
+        support_mask[support_idx] = False
+        query_train_idx = torch.nonzero(support_mask, as_tuple=False).flatten()
 
-        X_qry = torch.cat([X_train[n_support:], X_test], dim=0)
-        y_qry = torch.cat([y_train[n_support:], y_test], dim=0)
+        X_sup = X_train[support_idx]
+        y_sup = y_train[support_idx]
+
+        X_qry = torch.cat([X_train[query_train_idx], X_test], dim=0)
+        y_qry = torch.cat([y_train[query_train_idx], y_test], dim=0)
 
         X_seq = torch.cat([X_sup, X_qry], dim=0)
         X_seq_list.append(X_seq)
@@ -417,12 +552,20 @@ def _build_meta_tasks(model, batch_datasets, device, args):
         if n_classes < 1:
             continue
 
-        for _ in range(args.n_augmentations):
-            X_aug, y_sup_aug, y_qry_aug = augment_batch(emb, y_sup, y_qry, device, n_classes)
-            aug_emb_list.append(X_aug.squeeze(0))
-            aug_y_sup_list.append(y_sup_aug.squeeze(0))
-            aug_y_qry_list.append(y_qry_aug.squeeze(0))
-            aug_mask_list.append(mask)
+        X_views, y_sup_views, y_qry_views, _shifts, mask_out = build_views(
+            emb,
+            y_sup,
+            y_qry,
+            mask,
+            n_classes,
+            args.n_augmentations,
+            device=device,
+            enable_feat_perm=(not args.train_no_feat_perm),
+        )
+        aug_emb_list.extend([X_views[k] for k in range(X_views.size(0))])
+        aug_y_sup_list.extend([y_sup_views[k] for k in range(y_sup_views.size(0))])
+        aug_y_qry_list.extend([y_qry_views[k] for k in range(y_qry_views.size(0))])
+        aug_mask_list.extend([mask_out for _ in range(X_views.size(0))])
 
     if not aug_emb_list:
         return None
@@ -505,7 +648,7 @@ def train_step(model, optimizer, criterion, batch_datasets, device, args):
         y_flat = y_qry_in.reshape(-1)
         mask_flat = mask_in.reshape(-1)
 
-        loss = criterion(logits_flat[mask_flat], y_flat[mask_flat])
+        loss = criterion(logits_flat[mask_flat], y_flat[mask_flat])+1e-4 * (model.adapter.alpha ** 2)
         loss = loss / X_aug_batch.size(0)
 
         # Ensure graph exists even if something odd happens
@@ -546,10 +689,10 @@ def main():
     parser.add_argument("--meta_batch_size", type=int, default=8, help="Number of datasets per training step")
     parser.add_argument("--train_size", type=int, default=100, help="Number of support samples (context size)")
     parser.add_argument("--output_file", type=str, default=None, help="Path to save results JSON")
-    parser.add_argument("--seed", type=int, default=666, help="Random seed for reproducibility")
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--n_augmentations", type=int, default=5, help="Number of augmentations per dataset")
     parser.add_argument("--val_ratio", type=float, default=0.1, help="Validation ratio (held-out datasets) during adapter pretraining")
-    parser.add_argument("--ckpt_dir", type=str, default="/data0/fangjuntao2025/tabicl-main/checkpoints/mantis_adapter_pretrain", help="Directory to save adapter checkpoints")
+    parser.add_argument("--ckpt_dir", type=str, default="/data0/fangjuntao2025/tabicl-main/checkpoints/mantis_adapter_pretrainNew", help="Directory to save adapter checkpoints")
     parser.add_argument("--ckpt_prefix", type=str, default="adapter", help="Checkpoint filename prefix")
     parser.add_argument("--save_last", action="store_true", help="Also save last checkpoint each epoch")
 
@@ -581,6 +724,19 @@ def main():
         type=int,
         default=10,
         help="Target number of channels after variance-based selection (UEA only).",
+    )
+
+    # Inference-time control for TabICLClassifier augmentations
+    parser.add_argument(
+        "--infer_no_feat_shuffle",
+        action="store_true",
+        help="During evaluation/inference, disable TabICLClassifier feature-dimension shuffling (D-dim permutation). Keeps norm + class shift.",
+    )
+
+    parser.add_argument(
+        "--train_no_feat_perm",
+        action="store_true",
+        help="During adapter pretraining/meta-task augmentation, disable feature-dimension permutation (D-dim randperm). Keep norm + class shift.",
     )
     
     args = parser.parse_args()
@@ -618,8 +774,9 @@ def main():
     if args.no_adapter:
         adapter = None
     else:
-        adapter = CALDA_Adapter(mantis_emb_dim=mantis_dim, tabicl_input_dim=tabicl_dim).to(device)
-    
+        #adapter = CALDA_Adapter(mantis_emb_dim=mantis_dim, tabicl_input_dim=tabicl_dim).to(device)
+        adapter = SafeResidualAdapter(dim=mantis_dim, hidden=256, dropout=0.0, fuse="mean").to(device)
+
     model = MantisAdapterTabICL(
         mantis_model,
         tabicl_model,
@@ -631,7 +788,7 @@ def main():
     reader = DataReader(UEA_data_path=args.uea_path, UCR_data_path=args.ucr_path)
     
     # Combine UCR and UEA datasets
-    datasets = sorted(reader.dataset_list_ucr+reader.dataset_list_uea)
+    datasets = sorted(reader.dataset_list_ucr)
 
     # Split datasets into train/val for meta-pretraining
     train_datasets = datasets
@@ -648,7 +805,12 @@ def main():
     #--- Pretraining Phase ---
     if not args.no_adapter:
         print(f"Starting Pretraining on {len(train_datasets)} datasets for {args.epochs} epochs...")
-        optimizer = optim.AdamW(model.adapter.parameters(), lr=args.lr, weight_decay=1e-4)
+        #optimizer = optim.AdamW(model.adapter.parameters(), lr=args.lr, weight_decay=1e-4)
+        optimizer = torch.optim.AdamW([
+            {"params": model.adapter.fc1.parameters(), "lr": 1e-4, "weight_decay": 0.0},
+            {"params": model.adapter.fc2.parameters(), "lr": 1e-4, "weight_decay": 0.0},
+            {"params": [model.adapter.alpha],         "lr": 1e-5, "weight_decay": 0.0},
+        ])
         criterion = nn.CrossEntropyLoss()
 
         os.makedirs(args.ckpt_dir, exist_ok=True)
@@ -802,16 +964,20 @@ def main():
             print("[Eval] No adapter checkpoint found; using current adapter weights.")
     
     # Initialize Classifier for evaluation
+    infer_feat_shuffle_method = "none" if args.infer_no_feat_shuffle else "latin"
+    if args.infer_no_feat_shuffle:
+        print("[Eval] TabICLClassifier: feature shuffle disabled (feat_shuffle_method='none').")
     clf = TabICLClassifier(
         model_path=args.tabicl_ckpt,
         n_estimators=32,
+        feat_shuffle_method=infer_feat_shuffle_method,
         device=device,
         verbose=False,
         mantis_checkpoint=None,
         batch_size=8,
     )
     
-    all_datasets = sorted(reader.dataset_list_ucr + reader.dataset_list_uea)
+    all_datasets = sorted(reader.dataset_list_ucr)
     for dataset_name in tqdm(all_datasets, desc="Evaluating"):
         try:
             is_uea = dataset_name in reader.dataset_list_uea

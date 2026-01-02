@@ -2,6 +2,133 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class ChannelMLPConcatAdapter(nn.Module):
+    """
+    Adapter: per-channel 2-layer MLP -> d-dim, then concat across channels.
+
+    Input:  x of shape (N, C, D)
+    Output: z_concat of shape (N, C*d)
+
+    Optional: if out_dim is set, will project (C*d) -> out_dim.
+    """
+    def __init__(
+        self,
+        in_dim: int = 256,     # D
+        hidden_dim: int = 256, # hidden size for MLP
+        out_per_channel: int = 64,  # d
+        dropout: float = 0.0,
+        out_dim: int | None = None, # optional final projection, e.g. TabICL input dim
+        use_layernorm: bool = True,
+    ):
+        super().__init__()
+        self.in_dim = in_dim
+        self.hidden_dim = hidden_dim
+        self.d = out_per_channel
+        self.out_dim = out_dim
+
+        layers = []
+        layers.append(nn.Linear(in_dim, hidden_dim))
+        layers.append(nn.GELU())
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
+        layers.append(nn.Linear(hidden_dim, out_per_channel))
+
+        self.channel_mlp = nn.Sequential(*layers)
+        self.ln = nn.LayerNorm(out_per_channel) if use_layernorm else nn.Identity()
+
+        # Final projection (optional): (C*d) -> out_dim
+        # Use a valid placeholder module; real Linear is built lazily on first forward if out_dim is set.
+        self.final_proj = nn.Identity()
+        self._final_proj_built = False
+
+    def _build_final_proj(self, C: int, device):
+        if self.out_dim is None:
+            return
+        self.final_proj = nn.Linear(C * self.d, self.out_dim).to(device)
+        self._final_proj_built = True
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (N, C, D)
+        returns:
+          - if out_dim is None: (N, C*d)
+          - else:              (N, out_dim)
+        """
+        if x.dim() != 3:
+            raise ValueError(f"Input must be (N, C, D). Got shape {tuple(x.shape)}")
+
+        N, C, D = x.shape
+        if D != self.in_dim:
+            raise ValueError(f"Expected in_dim={self.in_dim}, but got D={D}")
+
+        # Apply per-channel MLP: reshape to (N*C, D) -> (N*C, d) -> (N, C, d)
+        z = x.reshape(N * C, D)
+        z = self.channel_mlp(z)              # (N*C, d)
+        z = self.ln(z)                       # (N*C, d)
+        z = z.reshape(N, C, self.d)          # (N, C, d)
+
+        # Concat across channels: (N, C*d)
+        z_concat = z.reshape(N, C * self.d)
+
+        # Optional final projection to match TabICL input dim
+        if self.out_dim is not None:
+            if not self._final_proj_built:
+                self._build_final_proj(C, x.device)
+            return self.final_proj(z_concat)
+
+        return z_concat
+
+class SafeResidualAdapter(nn.Module):
+    """
+    UCR-safe adapter:
+      - Input:  (N, C, D)
+      - Output: (N, D)   (matches TabICL input dim when D=256)
+    Key property:
+      - Initialized to (almost) exact identity for C=1
+      - Learns a residual delta with a learnable gate alpha (init=0)
+    """
+    def __init__(self, dim=256, hidden=256, dropout=0.0, fuse="mean"):
+        super().__init__()
+        assert fuse in ["mean", "first"], "fuse must be 'mean' or 'first'"
+        self.dim = dim
+        self.fuse = fuse
+
+        self.fc1 = nn.Linear(dim, hidden)
+        self.fc2 = nn.Linear(hidden, dim)
+        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+
+        # Learnable residual scale; init=0 => exact baseline (for C=1)
+        self.alpha = nn.Parameter(torch.tensor(0.0))
+
+        # **critical**: make residual branch start at zero
+        nn.init.zeros_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (N, C, D)
+        if x.dim() != 3:
+            raise ValueError(f"Input must be (N, C, D). Got {tuple(x.shape)}")
+        N, C, D = x.shape
+        if D != self.dim:
+            raise ValueError(f"Expected dim={self.dim}, but got D={D}")
+
+        # Baseline embedding:
+        # - UCR: C=1 => mean == first == x[:,0,:]
+        if self.fuse == "first":
+            base = x[:, 0, :]
+        else:
+            base = x.mean(dim=1)
+
+        # Residual delta
+        h = F.gelu(self.fc1(base))
+        h = self.drop(h)
+        delta = self.fc2(h)  # starts at 0 exactly
+
+        return base + self.alpha * delta
 class GatedAttentionPooling(nn.Module):
     """
     Gated Attention Pooling Layer for MCM.
