@@ -325,6 +325,104 @@ class CALDA_AdapterV2(nn.Module):
         using the same CALDA blocks.
     """
 
+    def __init__(
+        self,
+        mantis_emb_dim: int = 256,
+        tabicl_input_dim: int = 128,
+        out_dim: int | None = None,
+        *,
+        mcm_num_heads: int = 4,
+        mcm_dropout: float = 0.1,
+        bottleneck_dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.mantis_emb_dim = mantis_emb_dim
+        self.tabicl_input_dim = tabicl_input_dim
+        self.out_dim = out_dim
+
+        self.mcm_num_heads = int(mcm_num_heads)
+        self.mcm_dropout = float(mcm_dropout)
+        self.bottleneck_dropout = float(bottleneck_dropout)
+
+        # Same modules as CALDA_Adapter, but applied per-channel.
+        self.mcm = MultivariateChannelMixer(
+            emb_dim=mantis_emb_dim,
+            num_heads=self.mcm_num_heads,
+            dropout=self.mcm_dropout,
+        )
+        self.bottleneck = nn.Linear(mantis_emb_dim, tabicl_input_dim)
+        self.bottleneck_drop = nn.Dropout(self.bottleneck_dropout) if self.bottleneck_dropout > 0 else nn.Identity()
+        # self.bottleneck2 = nn.Linear(512, tabicl_input_dim)
+
+        # Optional final projection: (C * tabicl_input_dim) -> out_dim
+        # Built lazily on first forward because C can vary across datasets.
+        self.final_proj = nn.Identity()
+        self._final_proj_built = False
+        self._final_proj_in_dim: int | None = None
+
+    def _build_final_proj(self, in_dim: int, device):
+        if self.out_dim is None:
+            return
+        self.final_proj = nn.Linear(in_dim, self.out_dim).to(device)
+        self._final_proj_built = True
+        self._final_proj_in_dim = int(in_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B, C, mantis_emb_dim)
+        returns: (B, C * tabicl_input_dim)
+        """
+        if x.dim() != 3:
+            raise ValueError(
+                f"Input must be (Batch, Channels, Emb_Dim). Got shape {tuple(x.shape)}"
+            )
+
+        B, C, D = x.shape
+        if D != self.mantis_emb_dim:
+            raise ValueError(f"Expected mantis_emb_dim={self.mantis_emb_dim}, but got D={D}")
+
+        # Process each channel independently by folding C into batch.
+        # (B, C, D) -> (B*C, 1, D)
+        x_per_channel = x.reshape(B * C, 1, D)
+
+        # 1) MCM (trivial self-attn for channel length=1) + pooling => (B*C, D)
+        z_mixed = self.mcm(x_per_channel)
+
+        # 2) Bottleneck => (B*C, tabicl_input_dim)
+        z_proj = self.bottleneck(z_mixed)
+        z_proj = self.bottleneck_drop(z_proj)
+
+        # (B*C, tabicl_input_dim) -> (B, C, tabicl_input_dim) -> (B, C*tabicl_input_dim)
+        z_proj = z_proj.reshape(B, C, self.tabicl_input_dim)
+        z_concat = z_proj.reshape(B, C * self.tabicl_input_dim)
+
+        if self.out_dim is not None:
+            in_dim = int(C * self.tabicl_input_dim)
+            if (not self._final_proj_built) or (self._final_proj_in_dim != in_dim):
+                self._build_final_proj(in_dim, x.device)
+            return self.final_proj(z_concat)
+
+        return z_concat 
+     
+
+
+class CALDAMLP_AdapterV2(nn.Module):
+    """
+    CALDA v2: Per-channel pathway + concat.
+
+    For multivariate time-series input x with shape (B, C, mantis_emb_dim):
+      - For each channel independently, run:
+          MCM (with C=1) -> bottleneck1 -> bottleneck2
+        producing z_c of shape (B, tabicl_input_dim)
+      - Concatenate over channels to get final output:
+          z_out of shape (B, C * tabicl_input_dim)
+
+    Notes:
+      - We reuse the same weights across channels.
+      - This keeps channels separated (no cross-channel mixing) while still
+        using the same CALDA blocks.
+    """
+
     def __init__(self, mantis_emb_dim: int = 256, tabicl_input_dim: int = 128, out_dim: int | None = None):
         super().__init__()
         self.mantis_emb_dim = mantis_emb_dim
@@ -332,7 +430,7 @@ class CALDA_AdapterV2(nn.Module):
         self.out_dim = out_dim
 
         # Same modules as CALDA_Adapter, but applied per-channel.
-        self.mcm = MultivariateChannelMixer(emb_dim=mantis_emb_dim)
+        self.mcm = nn.Linear(mantis_emb_dim,mantis_emb_dim)
         self.bottleneck = nn.Linear(mantis_emb_dim, tabicl_input_dim)
         # self.bottleneck2 = nn.Linear(512, tabicl_input_dim)
 
@@ -384,7 +482,6 @@ class CALDA_AdapterV2(nn.Module):
             return self.final_proj(z_concat)
 
         return z_concat 
-     
     
 class CALDA_Adapter(nn.Module):
     """

@@ -24,6 +24,7 @@ def _load_generic_state_dict(model: nn.Module, checkpoint: dict, strict: bool = 
         "model_state_dict",
         "model",
         "network",
+        "net_param",
         "checkpoint",
     ]
 

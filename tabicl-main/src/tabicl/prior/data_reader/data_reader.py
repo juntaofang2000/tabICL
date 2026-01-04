@@ -30,6 +30,11 @@ class DataReader:
     univariate : bool
         若为 True，则把形状从 ``(n_samples, n_channels, seq_len)`` 重排为
         ``(n_samples * n_channels, 1, seq_len)``，即把多通道展开为多个单通道样本。
+    channel_concat : bool
+        若为 True（默认 False），则把多通道沿时间维拼接为单通道长序列：
+        ``(n_samples, n_channels, seq_len) -> (n_samples, 1, n_channels * seq_len)``。
+        随后再用 ``resize_func`` 将拼接后的长序列重采样到 ``transform_ts_size``。
+        - 与 ``univariate`` 互斥：如果 ``univariate=True``，则不会启用 channel_concat。
     nan_fill_mode : str
         控制在读取 UEA ``.ts`` 文件时如何处理 NaN。
         目前支持：
@@ -51,7 +56,7 @@ class DataReader:
 
     def __init__(self, UCR_data_path='/data/', UEA_data_path='/data2/', transform_ts_size=512,
                  resize_func=None, univariate=False, nan_fill_mode: str = "zero",
-                 log_processing: bool = False):
+                 log_processing: bool = False, channel_concat: bool = False):
         self.UCR_data_path = UCR_data_path
         self.UEA_data_path = UEA_data_path
         self.UniTS_data_path = None
@@ -71,7 +76,34 @@ class DataReader:
         self.log_processing = log_processing
 
         self.univariate = univariate
+        self.channel_concat = channel_concat
         self._get_dataset_lists()
+
+    def _maybe_channel_concat(self, X: torch.Tensor) -> torch.Tensor:
+        """可选：把多通道 (N,C,L) 拼接为单通道长序列 (N,1,C*L)。
+
+        - 仅在 self.channel_concat=True 且 self.univariate=False 时启用。
+        - C<=1 时为 no-op。
+        """
+        if (not self.channel_concat) or self.univariate:
+            return X
+
+        if not isinstance(X, torch.Tensor):
+            X = torch.as_tensor(X)
+
+        if X.ndim == 2:
+            # (N, L) -> (N, 1, L)
+            return X.unsqueeze(-2)
+
+        if X.ndim != 3:
+            return X
+
+        n, c, l = X.shape
+        if c <= 1:
+            return X
+
+        # (N, C, L) -> (N, 1, C*L)
+        return X.reshape(n, 1, c * l)
 
     # def _get_dataset_lists(self,):
     #     self.dataset_list_ucr = os.listdir(self.data_path + "UCRArchive_2018/")
@@ -183,6 +215,9 @@ class DataReader:
         X, y = torch.tensor(data[:, 1:], dtype=torch.float), data[:, 0]
         X = X.unsqueeze(-2)
 
+        # optional: concatenate multi-channel into one long univariate series
+        X = self._maybe_channel_concat(X)
+
         # interpolate time-series to self.transform_ts_size if not None
         if self.transform_ts_size is not None:
             X = self.resize_func(X)
@@ -209,6 +244,9 @@ class DataReader:
         # select only this channel if specified
         if channel_idx is not None:
             X = X[:, [channel_idx], :]
+
+        # optional: concatenate multi-channel into one long univariate series
+        X = self._maybe_channel_concat(X)
 
         # reshape to univariate if specified
         if self.univariate:
@@ -253,6 +291,9 @@ class DataReader:
         # select only this channel if specified
         if channel_idx is not None:
             X = X[:, [channel_idx], :]
+
+        # optional: concatenate multi-channel into one long univariate series
+        X = self._maybe_channel_concat(X)
 
         # reshape to univariate if specified
         if self.univariate:            
@@ -306,6 +347,9 @@ class DataReader:
         # select only this channel if specified
         if channel_idx is not None:
             X = X[:, [channel_idx], :]
+
+        # optional: concatenate multi-channel into one long univariate series
+        X = self._maybe_channel_concat(X)
 
         # reshape to univariate if specified
         if self.univariate:            

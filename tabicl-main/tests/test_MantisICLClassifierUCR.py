@@ -27,9 +27,9 @@ class UCREvaluator:
         # 初始化一次 MantisICLClassifier 并在多个数据集上复用，避免重复加载 checkpoint
         self.clf = MantisICLClassifier(
             verbose=False,
-            n_estimators=1,  # 取消数据增强
+            n_estimators=32,  # 取消数据增强
             checkpoint_version="tabicl-classifier-v1.1-0506.ckpt",
-            model_path="/data0/fangjuntao2025/tabicl-main/src/tabicl/checkpointsMantisICL12blocks/step-42300.ckpt",
+            model_path="/data0/fangjuntao2025/tabicl-main/checkpoints/mantisICL_mixup_run_v1/step-10000.ckpt",
         )
 
 

@@ -1,83 +1,924 @@
-"""train_adapter_with_classifierOrignv2
-
-Changes vs train_adapter_with_classifierOrign:
-- During adapter pretraining/validation ONLY, treat multichannel time series as a set
-  of single-channel samples by flattening channels into the sample dimension.
-
-Example:
-  X shape (125, 900, 512) -> (125*900, 1, 512)
-  Labels are repeated per channel (same label for all channels of a sample).
-
-Evaluation keeps the original dataset shapes/labels (no flattening).
-"""
-
+#关闭推理时 D 维置乱：python [train_adapter_with_classifierOrign.py](http://_vscodecontentref_/13) --infer_no_feat_shuffle
+# 训练/预训练阶段关闭 D 维置乱：加 --train_no_feat_perm
+# 推理阶段关闭 D 维置乱（TabICLClassifier 侧）：仍用你已有的 --infer_no_feat_shuffle
+#--debug_stats：每个 train_step 打印统计
 import argparse
 import os
 import sys
 import json
-import copy
+import torch
+import numpy as np
 import random
 from datetime import datetime
-from pathlib import Path
-
-import numpy as np
-import torch
 from torch import nn, optim
+from torch.utils.data import DataLoader, TensorDataset
+from pathlib import Path
 from tqdm import tqdm
+import copy
 
-# Add src to path (keep consistent with original script)
+# Add src to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../"))
 
-import tabicl.train.train_adapter_with_classifierOrign as base
+from tabicl.model.mantis_tabicl import MantisTabICL, build_mantis_encoder
+from tabicl.model.adapterOrign import CALDA_Adapter, CALDA_AdapterV2, CALDAMLP_AdapterV2, DistributionDiversityLoss,ChannelMLPConcatAdapter, SafeResidualAdapter,LoRAResidualAdapter,CausalChannelAdapter
+from tabicl.prior.data_reader import DataReader
+from tabicl.model.tabicl import TabICL
+from tabicl.sklearn.classifier import TabICLClassifier
+from tabicl.model.mantis_dev.adapters import VarianceBasedSelector
+from tabicl.model.adapter import StructuralCausalAdapter
+def load_dataset_names_from_file(filepath):
+    """从结果文件读取所有数据集名称（每行格式：name: acc）"""
+    names = []
+    with open(filepath, "r") as f:
+        for line in f:
+            if ":" in line:
+                name = line.split(":")[0].strip()
+                if name:
+                    names.append(name)
+    return names
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+def _ensure_three_dim(array: np.ndarray) -> np.ndarray:
+    arr = np.asarray(array, dtype=np.float32)
+    if arr.ndim == 1:
+        return arr[None, None, :]
+    if arr.ndim == 2:
+        return arr[:, None, :]
+    return arr
+
+def resize_series(X, target_len=512):
+    # X: (N, C, L)
+    # Resize L to target_len using interpolation
+    if X.shape[2] == target_len:
+        return torch.from_numpy(X).float()
+    
+    X_tensor = torch.from_numpy(X).float()
+    # F.interpolate expects (N, C, L)
+    X_resized = torch.nn.functional.interpolate(X_tensor, size=target_len, mode='linear', align_corners=False)
+    return X_resized
 
 
-def _flatten_multichannel_as_single_channel(X: torch.Tensor, y: torch.Tensor):
-    """Flatten (N, C, L) -> (N*C, 1, L) and repeat labels.
+def _flatten_multichannel_as_single_channel(
+    X: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flatten a multichannel dataset into single-channel samples for pretraining.
 
-    If C==1, returns inputs unchanged.
+    Example:
+      X: (N, C, L) -> (N*C, 1, L)
+      y: (N,)     -> (N*C,)  (repeat each label C times)
+
+    If C<=1, returns inputs unchanged.
     """
+    if not isinstance(X, torch.Tensor) or not isinstance(y, torch.Tensor):
+        return X, y
     if X.dim() != 3:
         return X, y
     N, C, L = X.shape
     if C <= 1:
         return X, y
-
-    # (N, C, L) -> (N*C, 1, L)
-    X_flat = X.contiguous().reshape(N * C, L).unsqueeze(1)
-    # (N,) -> (N*C,)
-    y_flat = y.repeat_interleave(C)
+    X_flat = X.contiguous().view(N * C, 1, L)
+    y_flat = y.contiguous().view(N).repeat_interleave(C)
     return X_flat, y_flat
 
 
-def load_dataset_data_pretrain_v2(reader, dataset_name, *, is_uea: bool, use_var_selector: bool, var_num_channels: int | None):
-    """Load dataset for pretraining with channel-flattening (multichannel -> many single-channel samples)."""
-    X_train, y_train, X_test, y_test = base.load_dataset_data(
-        reader,
-        dataset_name,
-        is_uea=is_uea,
-        use_var_selector=use_var_selector,
-        var_num_channels=var_num_channels,
-    )
-    if X_train is None:
+def _maybe_select_channels_uea(
+    X_train_raw,
+    X_test_raw,
+    *,
+    enabled: bool,
+    new_num_channels: int | None,
+    dataset_name: str | None = None,
+):
+    """Apply VarianceBasedSelector on UEA multichannel time series.
+
+    Fit selector on training split only, then transform train/test.
+    Expects input in (N, C, L) (or will be coerced by _ensure_three_dim).
+    """
+    if not enabled:
+        return X_train_raw, X_test_raw
+    if new_num_channels is None:
+        return X_train_raw, X_test_raw
+
+    X_train_np = _ensure_three_dim(X_train_raw)
+    X_test_np = _ensure_three_dim(X_test_raw)
+
+    if X_train_np.ndim != 3:
+        return X_train_raw, X_test_raw
+
+    _, c_train, _ = X_train_np.shape
+    if c_train <= 1:
+        return X_train_np, X_test_np
+
+    k = int(new_num_channels)
+    k = max(1, min(k, c_train))
+    if k == c_train:
+        return X_train_np, X_test_np
+
+    if dataset_name is not None:
+        print(f"[VarSelector][UEA] {dataset_name}: channels {c_train} -> {k}")
+
+    selector = VarianceBasedSelector(k)
+    selector.fit(X_train_np)
+    X_train_sel = selector.transform(X_train_np)
+    X_test_sel = selector.transform(X_test_np)
+    return X_train_sel, X_test_sel
+
+class MantisAdapterTabICL(nn.Module):
+    def __init__(self, mantis_model, tabicl_model, adapter, mantis_batch_size=16, mantis_fusion: str = "concat"):
+        super().__init__()
+        self.mantis_model = mantis_model
+        self.tabicl_model = tabicl_model
+        self.adapter = adapter
+        self.mantis_batch_size = mantis_batch_size
+        self.mantis_fusion = mantis_fusion
+        
+        # Freeze Mantis and TabICL
+        for param in self.mantis_model.parameters():
+            param.requires_grad = False
+        for param in self.tabicl_model.parameters():
+            param.requires_grad = False
+            
+    def train(self, mode=True):
+        """
+        Override train mode to keep Mantis and TabICL in eval mode.
+        """
+        super().train(mode)
+        self.mantis_model.eval()
+        self.tabicl_model.eval()
+        return self
+
+    def forward(self, X, y_train, return_logits=True):
+        # X: (Batch, Samples, Channels, Length)
+        B, N, C, L = X.shape
+        
+        # 1. Encode with Mantis
+        X_in = X.reshape(-1, L).unsqueeze(1) # (B*N*C, 1, L)
+        
+        # Batch processing for Mantis to avoid OOM
+        mantis_outs = []
+        total_samples = X_in.size(0)
+        
+        # Get device from mantis model
+        device = next(self.mantis_model.parameters()).device
+        
+        with torch.no_grad():
+            for i in range(0, total_samples, self.mantis_batch_size):
+                batch = X_in[i : i + self.mantis_batch_size]
+                batch = batch.to(device)
+                out = self.mantis_model(batch)
+                mantis_outs.append(out)
+            mantis_out = torch.cat(mantis_outs, dim=0)
+            
+        # 2. Adapter
+        mantis_out_reshaped = mantis_out.reshape(B*N, C, -1)
+
+        # v2: fuse multichannel representations by elementwise sum (instead of concat)
+        if self.mantis_fusion == "sum":
+            adapter_out = mantis_out_reshaped.sum(dim=1)
+        else:
+            if self.adapter is not None:
+                # Batch execution for Adapter
+                adapter_outs = []
+                adapter_batch_size = 32
+                for i in range(0, mantis_out_reshaped.size(0), adapter_batch_size):
+                    batch_slice = mantis_out_reshaped[i : i + adapter_batch_size]
+                    out_slice = self.adapter(batch_slice)
+                    adapter_outs.append(out_slice)
+                adapter_out = torch.cat(adapter_outs, dim=0)
+            else:
+                # concat/flatten over channels
+                adapter_out = mantis_out_reshaped.reshape(B*N, -1)
+        
+        # 3. TabICL
+        tabicl_in = adapter_out.reshape(B, N, -1)
+        out = self.tabicl_model(tabicl_in, y_train, return_logits=return_logits)
+        
+        return out, adapter_out
+
+    def get_adapter_output(self, X):
+        """
+        Get embeddings from Mantis + Adapter without passing through TabICL.
+        Useful for applying augmentations before TabICL.
+        """
+        # X: (Batch, Samples, Channels, Length)
+        B, N, C, L = X.shape
+        
+        # 1. Encode with Mantis
+        X_in = X.reshape(-1, L).unsqueeze(1) # (B*N*C, 1, L)
+        
+        # Batch processing for Mantis to avoid OOM
+        mantis_outs = []
+        total_samples = X_in.size(0)
+        
+        # Get device from mantis model
+        device = next(self.mantis_model.parameters()).device
+        
+        with torch.no_grad():
+            for i in range(0, total_samples, self.mantis_batch_size):
+                batch = X_in[i : i + self.mantis_batch_size]
+                batch = batch.to(device)
+                out = self.mantis_model(batch)
+                mantis_outs.append(out)
+            mantis_out = torch.cat(mantis_outs, dim=0)
+            
+        # 2. Adapter
+        mantis_out_reshaped = mantis_out.reshape(B*N, C, -1 ) # B=1
+
+        # v2: fuse multichannel representations by elementwise sum (instead of concat)
+        if self.mantis_fusion == "sum":
+            adapter_out = mantis_out_reshaped.sum(dim=1)
+        else:
+            if self.adapter is not None:
+                # Batch execution for Adapter
+                adapter_outs = []
+                adapter_batch_size = 32
+                for i in range(0, mantis_out_reshaped.size(0), adapter_batch_size):
+                    batch_slice = mantis_out_reshaped[i : i + adapter_batch_size]
+                    out_slice = self.adapter(batch_slice)
+                    adapter_outs.append(out_slice)
+                adapter_out = torch.cat(adapter_outs, dim=0)
+            else:
+                # concat/flatten over channels
+                adapter_out = mantis_out_reshaped.reshape(B*N, -1)
+            
+        return adapter_out.reshape(B, N, -1)
+
+def augment_batch(X, y_support, y_query, device, n_classes):
+        """Safe-by-default augmentations for adapter training.
+
+        Rationale:
+        - Disable random normalization: the adapter already ends with LayerNorm and
+            instance-wise (X-mean)/std destroys amplitude information.
+        - Disable feature permutation: the adapter must learn a stable, fixed feature
+            mapping (dimension semantics must not change across batches).
+        - Keep class shift: cyclic label shifting is non-destructive and helps prevent
+            overfitting to specific class IDs.
+
+        Returns:
+                X_aug: (B, L, D)
+                y_support_aug: (B, n_support)
+                y_query_aug: (B, qry_len)
+                perm: (D,) LongTensor feature permutation indices (identity)
+                shift: int class shift offset
+                norm_applied: bool (always False)
+        """
+        # X: (B, L, D)
+        # y_support: (B, n_support)
+        # y_query: (B, qry_len)
+
+        # Hard-disable destructive latent-space augmentations.
+        norm_applied = False
+
+        D = X.shape[-1]
+        perm = torch.arange(D, device=device)
+
+        # Keep class shift (safe).
+        shift = int(torch.randint(0, n_classes, (1,), device=device).item())
+        y_support = (y_support + shift) % n_classes
+        y_query = (y_query + shift) % n_classes
+
+        return X, y_support, y_query, perm, shift, norm_applied
+
+
+def build_views(
+    emb: torch.Tensor,
+    y_sup: torch.Tensor,
+    y_qry: torch.Tensor,
+    mask: torch.Tensor,
+    n_classes: int,
+    K: int,
+    *,
+    device: torch.device,
+):
+    """Build K augmented views for one task.
+
+    Args:
+        emb: (L, D) or (1, L, D)
+        y_sup: (n_support,) or (1, n_support)
+        y_qry: (qry_len,) or (1, qry_len)
+        mask: (qry_len,) boolean mask (kept unchanged)
+        n_classes: number of classes in this task
+        K: number of views
+
+    Returns:
+        X_views: (K, L, D)
+        y_sup_views: (K, n_support)
+        y_qry_views: (K, qry_len)
+        shifts: (K,) LongTensor
+        mask: (qry_len,) boolean mask (same as input)
+    """
+    if emb.dim() == 2:
+        emb_b = emb.unsqueeze(0)
+    else:
+        emb_b = emb
+
+    if y_sup.dim() == 1:
+        y_sup_b = y_sup.unsqueeze(0)
+    else:
+        y_sup_b = y_sup
+
+    if y_qry.dim() == 1:
+        y_qry_b = y_qry.unsqueeze(0)
+    else:
+        y_qry_b = y_qry
+
+    X_list = []
+    ysup_list = []
+    yqry_list = []
+    shifts_list = []
+
+    for _ in range(int(K)):
+        X_aug, y_sup_aug, y_qry_aug, _perm, shift, _norm_applied = augment_batch(
+            emb_b,
+            y_sup_b,
+            y_qry_b,
+            device,
+            n_classes,
+        )
+        X_list.append(X_aug.squeeze(0))
+        ysup_list.append(y_sup_aug.squeeze(0))
+        yqry_list.append(y_qry_aug.squeeze(0))
+        shifts_list.append(int(shift))
+
+    X_views = torch.stack(X_list, dim=0)
+    y_sup_views = torch.stack(ysup_list, dim=0)
+    y_qry_views = torch.stack(yqry_list, dim=0)
+    shifts = torch.tensor(shifts_list, dtype=torch.long, device=X_views.device)
+
+    return X_views, y_sup_views, y_qry_views, shifts, mask
+
+
+def get_embeddings(model, X_data, device, batch_size=64):
+    """
+    Helper to get embeddings from Mantis + Adapter.
+    X_data: (N, C, L) tensor or numpy array
+    """
+    if isinstance(X_data, np.ndarray):
+        X_data = torch.from_numpy(X_data).float()
+        
+    embs = []
+    N = X_data.size(0)
+    
+    model.eval()
+    with torch.no_grad():
+        for i in range(0, N, batch_size):
+            batch = X_data[i:i+batch_size].to(device)
+            B, C, L = batch.shape
+            batch_in = batch.reshape(-1, L).unsqueeze(1)
+            
+            # Process batch_in in smaller chunks for Mantis to avoid OOM
+            mantis_outs = []
+            sub_batch_size = 16 
+            for j in range(0, batch_in.size(0), sub_batch_size):
+                sub_batch = batch_in[j : j + sub_batch_size]
+                mantis_outs.append(model.mantis_model(sub_batch))
+            mantis_out = torch.cat(mantis_outs, dim=0) # (B*C, Mantis_Dim)
+            
+            # Fuse channels / Adapter
+            mantis_out_reshaped = mantis_out.reshape(B, C, -1)
+            if getattr(model, "mantis_fusion", "concat") == "sum":
+                adapter_out = mantis_out_reshaped.sum(dim=1)  # (B, Mantis_Dim)
+            else:
+                if model.adapter is not None:
+                    adapter_out = model.adapter(mantis_out_reshaped) # (B, TabICL_Dim)
+                else:
+                    adapter_out = mantis_out_reshaped.reshape(B, -1)
+                
+            embs.append(adapter_out.cpu().numpy())
+            
+    return np.concatenate(embs, axis=0)
+
+def load_dataset_data(reader, dataset_name, *, is_uea: bool, use_var_selector: bool, var_num_channels: int | None):
+    try:
+        X_train_raw, y_train_raw = reader.read_dataset(dataset_name, which_set="train")
+        X_test_raw, y_test_raw = reader.read_dataset(dataset_name, which_set="test")
+    except Exception as e:
+        print(f"Error loading {dataset_name}: {e}")
         return None, None, None, None
 
-    X_train, y_train = _flatten_multichannel_as_single_channel(X_train, y_train)
-    X_test, y_test = _flatten_multichannel_as_single_channel(X_test, y_test)
+    # UEA: optional variance-based channel compression (UCR stays unchanged)
+    if is_uea:
+        X_train_raw, X_test_raw = _maybe_select_channels_uea(
+            X_train_raw,
+            X_test_raw,
+            enabled=use_var_selector,
+            new_num_channels=var_num_channels,
+            dataset_name=dataset_name,
+        )
+
+    X_train = _ensure_three_dim(X_train_raw)
+    X_test = _ensure_three_dim(X_test_raw)
+    
+    X_train = resize_series(X_train, target_len=512)
+    X_test = resize_series(X_test, target_len=512)
+    
+    y_train = torch.from_numpy(y_train_raw).long()
+    y_test = torch.from_numpy(y_test_raw).long()
+    
     return X_train, y_train, X_test, y_test
 
 
+def _adapter_run_tag(adapter: nn.Module | None, args) -> str:
+    """Create a run tag for checkpoint naming.
+
+    Format: <AdapterClassName>_<YYYYmmdd_HHMMSS>
+    """
+    if adapter is None:
+        adapter_name = "NoAdapter" if getattr(args, "no_adapter", False) else "AdapterNone"
+    else:
+        adapter_name = adapter.__class__.__name__
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{adapter_name}_{ts}"
+
+
+def _find_latest_ckpt(ckpt_dir: str, patterns: list[str]) -> str | None:
+    """Find newest checkpoint in ckpt_dir matching any glob pattern."""
+    p = Path(ckpt_dir)
+    if not p.is_dir():
+        return None
+    candidates: list[Path] = []
+    for pat in patterns:
+        candidates.extend(p.glob(pat))
+    candidates = [c for c in candidates if c.is_file()]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+    return str(candidates[0])
+
+
+def _sample_support_indices_stratified(y_train: torch.Tensor, n_support: int) -> torch.Tensor:
+    """Sample support indices from training labels.
+
+    - Randomly samples n_support indices.
+    - Prefer stratified coverage: try to include as many unique classes as possible.
+
+    Returns a 1D LongTensor of shape (n_support,).
+    """
+    if not isinstance(y_train, torch.Tensor):
+        y_train = torch.as_tensor(y_train)
+    y_train = y_train.detach().cpu().long()
+
+    n_train = int(y_train.numel())
+    if n_support >= n_train:
+        return torch.arange(n_train, dtype=torch.long)
+
+    # Try to take at least one sample per class (up to n_support)
+    classes = torch.unique(y_train)
+    if classes.numel() == 0:
+        return torch.randperm(n_train)[:n_support]
+
+    classes = classes[torch.randperm(classes.numel())]
+    chosen = []
+
+    for cls in classes.tolist():
+        idxs = torch.nonzero(y_train == int(cls), as_tuple=False).flatten()
+        if idxs.numel() == 0:
+            continue
+        pick = idxs[torch.randint(0, idxs.numel(), (1,)).item()]
+        chosen.append(int(pick.item()))
+        if len(chosen) >= n_support:
+            break
+
+    chosen_idx = torch.tensor(chosen, dtype=torch.long)
+    if chosen_idx.numel() < n_support:
+        mask = torch.ones(n_train, dtype=torch.bool)
+        mask[chosen_idx] = False
+        remaining = torch.nonzero(mask, as_tuple=False).flatten()
+        extra = remaining[torch.randperm(remaining.numel())[: (n_support - chosen_idx.numel())]]
+        chosen_idx = torch.cat([chosen_idx, extra], dim=0)
+
+    # Shuffle support order
+    chosen_idx = chosen_idx[torch.randperm(chosen_idx.numel())]
+    return chosen_idx
+
+
+def _prepare_meta_tasks(model, batch_datasets, device, args):
+    """
+    Prepare meta-learning tasks and run adapter to get embeddings.
+    Does NOT perform augmentation.
+    """
+    min_train_len = min(d[0].size(0) for d in batch_datasets)
+    n_support = min(args.train_size, min_train_len)
+    if n_support < 1:
+        return None
+
+    X_seq_list = []
+    y_sup_mapped_list = []
+    y_qry_mapped_list = []
+    valid_mask_list = []
+
+    for X_train, y_train, X_test, y_test in batch_datasets:
+        tabicl_max = int(getattr(model.tabicl_model, "max_classes", 10))
+
+        classes_all = torch.unique(y_train)
+        if classes_all.numel() == 0:
+            continue
+
+        k = int(min(tabicl_max, int(classes_all.numel()), int(n_support)))
+        if k < 1:
+            continue
+
+        if classes_all.numel() > k:
+            perm = torch.randperm(classes_all.numel())
+            classes_keep = classes_all[perm[:k]]
+        else:
+            classes_keep = classes_all
+
+        keep_mask_train = torch.isin(y_train, classes_keep)
+        train_keep_idx = torch.nonzero(keep_mask_train, as_tuple=False).flatten()
+
+        # --- FIX 1: 强制每个 task 的 support 长度必须等于 n_support，否则跳过 ---
+        if int(train_keep_idx.numel()) < int(n_support):
+            continue
+
+        y_train_keep = y_train[train_keep_idx]
+        support_local = _sample_support_indices_stratified(
+            y_train_keep,
+            n_support=int(n_support),   # 固定长度
+        )
+        support_idx = train_keep_idx[support_local]
+
+        X_sup = X_train[support_idx]
+        y_sup = y_train[support_idx]
+
+        support_classes = torch.unique(y_sup)
+        keep_mask_train_sup = torch.isin(y_train, support_classes)
+        keep_mask_test_sup = torch.isin(y_test, support_classes)
+
+        support_mask = torch.ones(y_train.size(0), dtype=torch.bool)
+        support_mask[support_idx] = False
+        query_train_idx = torch.nonzero(support_mask & keep_mask_train_sup, as_tuple=False).flatten()
+        query_test_idx = torch.nonzero(keep_mask_test_sup, as_tuple=False).flatten()
+
+        X_qry = torch.cat([X_train[query_train_idx], X_test[query_test_idx]], dim=0)
+        y_qry = torch.cat([y_train[query_train_idx], y_test[query_test_idx]], dim=0)
+
+        if X_qry.size(0) < 1:
+            continue
+
+        X_seq = torch.cat([X_sup, X_qry], dim=0)
+        X_seq_list.append(X_seq)
+
+        unique_classes, inverse_indices = torch.unique(y_sup, return_inverse=True)
+        y_sup_mapped = inverse_indices.to(device)  # (n_support,) 现在保证长度一致
+
+        max_label = max(y_sup.max(), y_qry.max()).item()
+        mapper = torch.full((max_label + 1,), -1, dtype=torch.long, device=device)
+        mapper[unique_classes.to(device)] = torch.arange(len(unique_classes), device=device)
+
+        y_qry_mapped = mapper[y_qry.to(device)]
+        valid_mask = (y_qry_mapped != -1)
+
+        y_qry_mapped_safe = y_qry_mapped.clone()
+        y_qry_mapped_safe[~valid_mask] = 0
+
+        y_sup_mapped_list.append(y_sup_mapped)
+        y_qry_mapped_list.append(y_qry_mapped_safe)
+        valid_mask_list.append(valid_mask)
+
+    # --- FIX 2: 可能全部被 continue 掉，避免 min() 空列表崩溃 ---
+    if not X_seq_list:
+        return None
+
+    min_len = min(x.size(0) for x in X_seq_list)
+    target_len = min(min_len, args.max_icl_len)
+    if target_len <= n_support:
+        return None
+
+    adapter_out_list = []
+    y_sup_batch_list = []
+    y_qry_batch_list = []
+    mask_batch_list = []
+
+    # --- FIX 3: 用 X_seq_list 的长度来 collate，避免和 batch_datasets 长度不一致导致错位 ---
+    for i in range(len(X_seq_list)):
+        x_item = X_seq_list[i][:target_len]
+        emb = model.get_adapter_output(x_item.unsqueeze(0))  # (1, L, D)
+        adapter_out_list.append(emb.squeeze(0))
+
+        y_sup_batch_list.append(y_sup_mapped_list[i])
+
+        qry_len = target_len - n_support
+        y_qry_batch_list.append(y_qry_mapped_list[i][:qry_len])
+        mask_batch_list.append(valid_mask_list[i][:qry_len])
+
+    adapter_out = torch.stack(adapter_out_list)  # (B, L, D)
+    return adapter_out, y_sup_batch_list, y_qry_batch_list, mask_batch_list, n_support
+
+
+def _augment_meta_tasks(adapter_out, y_sup_batch_list, y_qry_batch_list, mask_batch_list, n_support, device, args):
+    """
+    Augment embeddings to create meta-tasks.
+    """
+    # 3) Augment
+    aug_emb_list = []
+    aug_y_sup_list = []
+    aug_y_qry_list = []
+    aug_mask_list = []
+
+    for i in range(adapter_out.size(0)):
+        emb = adapter_out[i].unsqueeze(0)  # (1, L, D)
+        y_sup = y_sup_batch_list[i].unsqueeze(0)  # (1, n_support)
+        y_qry = y_qry_batch_list[i].unsqueeze(0)  # (1, qry_len)
+        mask = mask_batch_list[i]
+
+        n_classes = y_sup.max().item() + 1
+        # Handle degenerate tasks
+        if n_classes < 1:
+            continue
+
+        X_views, y_sup_views, y_qry_views, _shifts, mask_out = build_views(
+            emb,
+            y_sup,
+            y_qry,
+            mask,
+            n_classes,
+            args.n_augmentations,
+            device=device,
+            #enable_feat_perm=(not args.train_no_feat_perm),
+        )
+        aug_emb_list.extend([X_views[k] for k in range(X_views.size(0))])
+        aug_y_sup_list.extend([y_sup_views[k] for k in range(y_sup_views.size(0))])
+        aug_y_qry_list.extend([y_qry_views[k] for k in range(y_qry_views.size(0))])
+        aug_mask_list.extend([mask_out for _ in range(X_views.size(0))])
+
+    if not aug_emb_list:
+        return None
+
+    X_aug_batch = torch.stack(aug_emb_list)
+    y_sup_aug_batch = torch.stack(aug_y_sup_list)
+    y_qry_aug_batch = torch.stack(aug_y_qry_list)
+    valid_mask_batch = torch.stack(aug_mask_list)
+
+    qry_len = y_qry_aug_batch.size(1)
+    return X_aug_batch, y_sup_aug_batch, y_qry_aug_batch, valid_mask_batch, n_support, qry_len
+
+
+def _build_meta_tasks(model, batch_datasets, device, args):
+    """
+    Legacy wrapper for compatibility.
+    """
+    prepared = _prepare_meta_tasks(model, batch_datasets, device, args)
+    if prepared is None:
+        return None
+    adapter_out, y_sup_batch_list, y_qry_batch_list, mask_batch_list, n_support = prepared
+    return _augment_meta_tasks(adapter_out, y_sup_batch_list, y_qry_batch_list, mask_batch_list, n_support, device, args)
+
+
+
+def _tabicl_train_forward(
+    tabicl_model,
+    X: torch.Tensor,
+    y_train: torch.Tensor,
+    d: torch.Tensor | None = None,
+    *,
+    embed_with_test: bool = False,
+) -> torch.Tensor:
+    """Run TabICL training forward without toggling model.train()."""
+    B, T, H = X.shape
+    train_size = y_train.shape[1]
+    assert train_size <= T, "Number of training samples exceeds total samples"
+
+    if d is not None and len(d.unique()) == 1 and d[0] == H:
+        d = None
+
+    embeddings = tabicl_model.col_embedder._train_forward(
+        X, d, None if embed_with_test else train_size
+    )
+    representations = tabicl_model.row_interactor._train_forward(embeddings, d)
+    return tabicl_model.icl_predictor._icl_predictions(representations, y_train)
+
+
+def _compute_meta_loss(model, criterion, X_aug_batch, y_sup_aug_batch, y_qry_aug_batch, valid_mask_batch):
+    """Compute averaged meta loss across tasks in X_aug_batch."""
+    total_loss = 0.0
+    denom = 0
+
+    for i in range(X_aug_batch.size(0)):
+        X_in = X_aug_batch[i].unsqueeze(0)  # (1, L, D)
+        y_sup_in = y_sup_aug_batch[i].unsqueeze(0)  # (1, n_support)
+        y_qry_in = y_qry_aug_batch[i].unsqueeze(0)  # (1, qry_len)
+        mask_in = valid_mask_batch[i]  # (qry_len,)
+
+        if not mask_in.any():
+            continue
+
+        logits = _tabicl_train_forward(
+            model.tabicl_model, X_in, y_sup_in, d=None, embed_with_test=False
+        )
+
+        qry_len = y_qry_in.size(1)
+        if logits.size(1) == X_in.size(1):
+            logits_qry = logits[:, -qry_len:, :]
+        else:
+            logits_qry = logits
+
+        logits_flat = logits_qry.reshape(-1, logits_qry.size(-1))
+        y_flat = y_qry_in.reshape(-1)
+        mask_flat = mask_in.reshape(-1)
+
+        loss = criterion(logits_flat[mask_flat], y_flat[mask_flat])
+        total_loss += loss.item()
+        denom += 1
+
+    if denom == 0:
+        return None
+    return total_loss / denom
+
+
+def train_step(model, optimizer, criterion, batch_datasets, device, args):
+    model.train()
+    optimizer.zero_grad()
+
+    # 1. Prepare data and run Adapter (get embeddings)
+    prepared = _prepare_meta_tasks(model, batch_datasets, device, args)
+    if prepared is None:
+        return 0.0
+    adapter_out, y_sup_batch_list, y_qry_batch_list, mask_batch_list, n_support = prepared
+    
+    # adapter_out: (B, L, D) - connected to Adapter graph
+    
+    total_loss = 0.0
+    denom = 0
+
+    # Debug/observability stats (per train_step)
+    skipped_mask_empty = 0
+    skipped_oob = 0
+    skipped_other = 0
+    valid_ratio_sum = 0.0
+    
+    # Scale factor for loss averaging
+    # scale_factor = 1.0 / (adapter_out.size(0) * args.n_augmentations)
+
+    # Initialize gradient tensor for adapter output
+    grad_adapter_out = torch.zeros_like(adapter_out)
+
+    # 2. Loop over datasets (tasks)
+    for i in range(adapter_out.size(0)):
+        # Get embedding for this dataset
+        emb = adapter_out[i] # (L, D)
+        
+        # Detach to create a leaf for gradient accumulation
+        emb_leaf = emb.detach().requires_grad_(True)
+        
+        y_sup = y_sup_batch_list[i]
+        y_qry = y_qry_batch_list[i]
+        mask = mask_batch_list[i]
+        
+        n_classes = y_sup.max().item() + 1
+        tabicl_max = int(getattr(model.tabicl_model, "max_classes", 10))
+        if n_classes < 2:
+            skipped_other += int(args.n_augmentations)
+            continue
+        if n_classes > tabicl_max:
+            # Should not happen if _prepare_meta_tasks is correct, but keep it safe
+            skipped_other += int(args.n_augmentations)
+            continue
+        grad_sum = torch.zeros_like(emb_leaf)
+        used_views = 0
+
+        for _ in range(int(args.n_augmentations)):
+            # One independent augmented view (new graph each iteration)
+            X_aug, y_sup_aug, y_qry_aug, _perm, _shift, _norm_applied = augment_batch(
+                emb_leaf.unsqueeze(0),          # (1, L, D)
+                y_sup.unsqueeze(0),             # (1, n_support)
+                y_qry.unsqueeze(0),             # (1, qry_len)
+                device,
+                n_classes,
+            )
+
+            X_in = X_aug                          # (1, L, D)
+            y_sup_in = y_sup_aug                  # (1, n_support)
+            y_qry_in = y_qry_aug                  # (1, qry_len)
+            mask_in = mask                        # (qry_len,)
+
+            if not mask_in.any():
+                skipped_mask_empty += 1
+                continue
+
+            if getattr(args, "debug_oob", False):
+                print(f"[Pre-Forward] Task {i}: n_classes={n_classes}, y_sup_in max={y_sup_in.max()}")
+                torch.cuda.synchronize()
+
+            logits = _tabicl_train_forward(
+                model.tabicl_model, X_in, y_sup_in, d=None, embed_with_test=False
+            )
+
+            if getattr(args, "debug_oob", False):
+                torch.cuda.synchronize()
+
+            if args.debug_grad:
+                print(
+                    "X_in_requires_grad",
+                    X_in.requires_grad,
+                    "logits_requires_grad",
+                    logits.requires_grad,
+                    "grad_fn",
+                    logits.grad_fn,
+                )
+
+            if not logits.requires_grad:
+                raise RuntimeError(
+                    "TabICL logits has no grad: check _tabicl_train_forward path / no_grad / detach."
+                )
+
+            qry_len = y_qry_in.size(1)
+            logits_qry = logits[:, -qry_len:, :] if logits.size(1) == X_in.size(1) else logits
+
+            logits_flat = logits_qry.reshape(-1, logits_qry.size(-1))
+            y_flat = y_qry_in.reshape(-1)
+            mask_flat = mask_in.reshape(-1)
+
+            if not mask_flat.any():
+                skipped_mask_empty += 1
+                continue
+
+            y_sel = y_flat[mask_flat]
+            C = logits_flat.size(-1)
+            y_min = y_sel.min().item()
+            y_max = y_sel.max().item()
+
+            if y_min < 0 or y_max >= C:
+                if getattr(args, "debug_oob", False):
+                    print(f"[OOB] Task {i}: y_min={y_min}, y_max={y_max}, C={C}, n_classes={n_classes}")
+                    print(f"      uniq(y_sup_in)={torch.unique(y_sup_in).tolist()}")
+                    print(f"      uniq(y_sel)={torch.unique(y_sel)[:20].tolist()}")
+                skipped_oob += 1
+                continue
+
+            loss = criterion(logits_flat[mask_flat], y_sel)
+
+            # Observability: how many query positions are valid (mask ratio)
+            valid_ratio_sum += float(mask_flat.float().mean().item())
+
+            # Take gradient wrt emb_leaf only (do not backward through adapter graph here)
+            g = torch.autograd.grad(loss, emb_leaf, retain_graph=False, allow_unused=False)[0]
+            grad_sum += g.detach()
+
+            total_loss += float(loss.item())
+            denom += 1
+            used_views += 1
+
+        if used_views > 0:
+            grad_adapter_out[i] = grad_sum / float(used_views)
+    # Backward pass for adapter
+    adapter_out.backward(grad_adapter_out)
+
+    optimizer.step()
+
+    if denom == 0:
+        if getattr(args, "debug_stats", False):
+            print(
+                f"[train_step][warn] denom=0 | skipped_mask_empty={skipped_mask_empty} "
+                f"skipped_oob={skipped_oob} skipped_other={skipped_other}"
+            )
+        return 0.0
+
+    avg_loss = total_loss / float(denom)
+    mean_valid_ratio = valid_ratio_sum / float(denom)
+
+    if getattr(args, "debug_stats", False):
+        print(
+            f"[train_step] avg_loss={avg_loss:.6f} denom={denom} "
+            f"skipped_mask_empty={skipped_mask_empty} skipped_oob={skipped_oob} "
+            f"skipped_other={skipped_other} mean_valid_ratio={mean_valid_ratio:.4f}"
+        )
+
+    return avg_loss
+
+
+@torch.no_grad()
+def validate_step(model, criterion, batch_datasets, device, args):
+    model.eval()
+    built = _build_meta_tasks(model, batch_datasets, device, args)
+    if built is None:
+        return None
+    X_aug_batch, y_sup_aug_batch, y_qry_aug_batch, valid_mask_batch, _, _ = built
+    return _compute_meta_loss(model, criterion, X_aug_batch, y_sup_aug_batch, y_qry_aug_batch, valid_mask_batch)
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--tabicl_ckpt",
-        type=str,
-        default="/data0/fangjuntao2025/tabicl-main/tabICLOrignCheckpoint/tabicl-classifier-v1.1-0506.ckpt",
-    )
-    parser.add_argument(
-        "--mantis_ckpt",
-        type=str,
-        default="/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint/",
-    )
+
+    def _add_bool_optional(parser: argparse.ArgumentParser, name: str, *, default: bool, help_text: str):
+        """Add a boolean flag that supports both --<name> and --no-<name> when available."""
+        action_cls = getattr(argparse, "BooleanOptionalAction", None)
+        if action_cls is not None:
+            parser.add_argument(f"--{name}", action=action_cls, default=default, help=help_text)
+        else:
+            parser.add_argument(f"--{name}", dest=name, action="store_true", help=help_text)
+            parser.add_argument(f"--no-{name}", dest=name, action="store_false", help=f"Disable: {help_text}")
+            parser.set_defaults(**{name: default})
+    parser.add_argument("--tabicl_ckpt", type=str, default="/data0/fangjuntao2025/tabicl-main/tabICLOrignCheckpoint/tabicl-classifier-v1.1-0506.ckpt")
+    parser.add_argument("--mantis_ckpt", type=str, default="/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint/")
     parser.add_argument("--uea_path", type=str, default="/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UEAData/")
     parser.add_argument("--ucr_path", type=str, default="/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UCRdata/")
     parser.add_argument("--epochs", type=int, default=3)
@@ -86,22 +927,53 @@ def main():
     parser.add_argument("--max_icl_len", type=int, default=512, help="Max sequence length for ICL training to avoid OOM")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--no_adapter", action="store_true", help="Disable adapter and use raw Mantis embeddings")
-    parser.add_argument("--mantis_batch_size", type=int, default=16, help="Batch size for Mantis encoder")
-    parser.add_argument("--meta_batch_size", type=int, default=16, help="Number of datasets per training step")
-    parser.add_argument("--train_size", type=int, default=100, help="Number of support samples (context size)")
+    parser.add_argument("--mantis_batch_size", type=int, default=128, help="Batch size for Mantis encoder")
+    parser.add_argument("--meta_batch_size", type=int, default=8, help="Number of datasets per training step")
+    parser.add_argument("--train_size", type=int, default=256, help="Number of support samples (context size)")
     parser.add_argument("--output_file", type=str, default=None, help="Path to save results JSON")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--n_augmentations", type=int, default=5, help="Number of augmentations per dataset")
     parser.add_argument("--val_ratio", type=float, default=0.1, help="Validation ratio (held-out datasets) during adapter pretraining")
-    parser.add_argument(
-        "--ckpt_dir",
-        type=str,
-        default="/data0/fangjuntao2025/tabicl-main/checkpoints/mantis_adapter_pretrainNew",
-        help="Directory to save adapter checkpoints",
-    )
+    parser.add_argument("--ckpt_dir", type=str, default="/data0/fangjuntao2025/tabicl-main/checkpoints/mantis_adapter_pretrainNew", help="Directory to save adapter checkpoints")
     parser.add_argument("--ckpt_prefix", type=str, default="adapter", help="Checkpoint filename prefix")
     parser.add_argument("--save_last", action="store_true", help="Also save last checkpoint each epoch")
 
+    _add_bool_optional(
+        parser,
+        "use_uea_pretrain",
+        default=True,
+        help_text="Whether to include UEA benchmark datasets during adapter pretraining/validation.",
+    )
+    _add_bool_optional(
+        parser,
+        "use_uea_eval",
+        default=True,
+        help_text="Whether to include UEA benchmark datasets during evaluation/inference.",
+    )#  --no-use_uea_eval False
+
+    parser.add_argument(
+        "--pretrain_flatten_channels",
+        action="store_true",
+        help=(
+            "During adapter pretraining/validation only: treat each channel as an independent single-channel sample. "
+            "Transforms (N,C,L)->(N*C,1,L) and repeats labels. Evaluation keeps original multichannel data."
+        ),
+    )
+
+    # Adapter type selection
+    parser.add_argument(
+        "--adapter_type",
+        type=str,
+        default="calda",
+        choices=["none", "calda", "calda_v2", "channel_mlp_concat", "safe_residual", "sca","lora_residual","cca","mlp_v2"],
+        help=(
+            "Which adapter to use when not --no_adapter. "
+            "none: disable adapter; calda: CALDA_Adapter; calda_v2: per-channel CALDA with concat then projection; "
+            "channel_mlp_concat: per-channel MLP + concat then projection; safe_residual: residual adapter; sca: StructuralCausalAdapter."
+        ),
+    )
+
+    # v2: how to fuse multichannel Mantis representations before TabICL
     parser.add_argument(
         "--mantis_fusion",
         type=str,
@@ -110,6 +982,7 @@ def main():
         help="How to fuse per-channel Mantis embeddings. 'concat' flattens channels; 'sum' adds them elementwise (v2).",
     )
 
+    # Adapter checkpoint selection for evaluation
     parser.add_argument(
         "--eval_adapter_ckpt",
         type=str,
@@ -117,6 +990,7 @@ def main():
         help="Path to an adapter checkpoint (.pt) to load for evaluation. If not set, auto-load best from ckpt_dir.",
     )
 
+    # Variance-based channel selector (UEA only)
     parser.add_argument(
         "--use_var_selector",
         action="store_true",
@@ -129,11 +1003,13 @@ def main():
         help="Target number of channels after variance-based selection (UEA only).",
     )
 
+    # Inference-time control for TabICLClassifier augmentations
     parser.add_argument(
         "--infer_no_feat_shuffle",
         action="store_true",
         help="During evaluation/inference, disable TabICLClassifier feature-dimension shuffling (D-dim permutation). Keeps norm + class shift.",
     )
+
     parser.add_argument(
         "--train_no_feat_perm",
         action="store_true",
@@ -145,61 +1021,152 @@ def main():
         help="Print requires_grad flags and grad_fn for TabICL logits during training.",
     )
     parser.add_argument(
-        "--debug_oob",
+        "--debug_stats",
         action="store_true",
-        help="Print details when CrossEntropy targets are out-of-bounds (prevents CUDA assert).",
+        help="Print per-train_step stats: denom / skipped views / mean_valid_ratio / avg_loss.",
     )
-
+    parser.add_argument("--debug_oob", action="store_true",
+                        help="Print details when CrossEntropy targets are out-of-bounds (prevents CUDA assert).")
+    
     args = parser.parse_args()
-
-    base.set_seed(args.seed)
-
+    
+    set_seed(args.seed)
+    
     device = torch.device(args.device)
-    if device.type == "cuda" and device.index is not None:
+    if device.type == 'cuda' and device.index is not None:
         torch.cuda.set_device(device)
-
+    
+    # 1. Build Models
     print("Loading models...")
-    mantis_model = base.build_mantis_encoder(args.mantis_ckpt, device=device)
-
+    # Load Mantis
+    mantis_model = build_mantis_encoder(args.mantis_ckpt, device=device)
+    
+    # Load TabICL (for training adapter)
     tabicl_state = torch.load(args.tabicl_ckpt, map_location="cpu")
-    tabicl_model = base.TabICL(**tabicl_state["config"])
+    tabicl_model = TabICL(**tabicl_state["config"])
     tabicl_model.load_state_dict(tabicl_state["state_dict"])
     tabicl_model.to(device)
-
+    
+    # Initialize Adapter
     tabicl_dim = 256
+    
     mantis_dim = mantis_model.hidden_dim
+    
     print(f"Mantis Dim: {mantis_dim}, TabICL Dim: {tabicl_dim}")
-
-    # Keep original behavior for sum-fusion
+    
+    # v2: sum-fusion is a non-parametric channel mixer; disable adapter training to match spec
     if args.mantis_fusion == "sum":
         if not args.no_adapter:
             print("[Info] mantis_fusion='sum' (v2) -> forcing --no_adapter (no learnable adapter).")
         args.no_adapter = True
 
-    if args.no_adapter:
-        adapter = None
-    else:
-        adapter = base.CALDA_Adapter(mantis_emb_dim=256, tabicl_input_dim=256).to(device)
+    # Adapter builder (keeps overall training framework unchanged)
+    def _build_adapter_from_args() -> nn.Module | None:
+        if args.no_adapter or args.adapter_type == "none":
+            return None
 
-    run_tag = base._adapter_run_tag(adapter, args)
+        if args.adapter_type == "calda":
+            return CALDA_Adapter(mantis_emb_dim=mantis_dim, tabicl_input_dim=tabicl_dim).to(device)
+
+        if args.adapter_type == "calda_v2":
+            # CALDA v2 internally concatenates per-channel outputs, then projects back to tabicl_dim
+            # to keep TabICL input dimension compatible with the checkpoint.
+            return CALDA_AdapterV2(
+                mantis_emb_dim=mantis_dim,
+                tabicl_input_dim=tabicl_dim,
+                # out_dim=tabicl_dim,
+            ).to(device)
+        
+        if args.adapter_type == "mlp_v2":
+                return CALDAMLP_AdapterV2(
+                mantis_emb_dim=mantis_dim,
+                tabicl_input_dim=tabicl_dim,
+                # out_dim=tabicl_dim,
+            ).to(device)
+
+        if args.adapter_type == "channel_mlp_concat":
+            return ChannelMLPConcatAdapter(
+                in_dim=mantis_dim,
+                hidden_dim=mantis_dim,
+                out_per_channel=64,
+                dropout=0.0,
+                out_dim=tabicl_dim,
+                use_layernorm=True,
+            ).to(device)
+
+        if args.adapter_type == "safe_residual":
+            return SafeResidualAdapter(
+                dim=mantis_dim,
+                hidden=256,
+                dropout=0.0,
+                fuse="concat",
+                out_dim=tabicl_dim,
+            ).to(device)
+
+        if args.adapter_type == "sca":
+            return StructuralCausalAdapter(emb_dim=mantis_dim).to(device)
+        if args.adapter_type == "lora_residual":   
+            return LoRAResidualAdapter(dim=mantis_dim, rank=8, dropout=0.0, fuse="mean").to(device)
+        if args.adapter_type == "cca":   
+            return CausalChannelAdapter(mantis_emb_dim=mantis_dim, tabicl_input_dim=256,num_latents=4).to(device)
+        
+        
+        raise ValueError(f"Unknown adapter_type={args.adapter_type}")
+
+    if args.mantis_fusion == "sum":
+        # v2: sum-fusion is a non-parametric channel mixer; disable adapter training to match spec
+        if not args.no_adapter:
+            print("[Info] mantis_fusion='sum' (v2) -> forcing --no_adapter (no learnable adapter).")
+        args.no_adapter = True
+        args.adapter_type = "none"
+
+    adapter = _build_adapter_from_args()
+    # Checkpoint naming: adapter class name + timestamp
+    run_tag = _adapter_run_tag(adapter, args)
     ckpt_base = f"{args.ckpt_prefix}_{run_tag}" if args.ckpt_prefix else run_tag
 
-    model = base.MantisAdapterTabICL(
+    # Record run arguments for reproducibility
+    args_log_path = None
+    args_payload = None
+    try:
+        os.makedirs(args.ckpt_dir, exist_ok=True)
+        args_log_path = os.path.join(args.ckpt_dir, f"{ckpt_base}_args.json")
+        args_payload = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "argv": sys.argv,
+            "args": vars(args),
+            "run_tag": run_tag,
+        }
+        with open(args_log_path, "w") as f:
+            json.dump(args_payload, f, indent=2, ensure_ascii=False)
+        print(f"[Run] Saved args log: {args_log_path}")
+    except Exception as e:
+        print(f"[Run][warn] Failed to save args log: {e}")
+
+    model = MantisAdapterTabICL(
         mantis_model,
         tabicl_model,
         adapter,
         mantis_batch_size=args.mantis_batch_size,
         mantis_fusion=args.mantis_fusion,
     ).to(device)
+    
+    reader = DataReader(UEA_data_path=args.uea_path, UCR_data_path=args.ucr_path)
+    
+    # Dataset selection for pretraining
+    if args.use_uea_pretrain:
+        datasets = sorted(reader.dataset_list_ucr + reader.dataset_list_uea)
+    else:
+        datasets = sorted(reader.dataset_list_ucr)
+    print(
+        f"[Data] Pretrain datasets: UCR={len(reader.dataset_list_ucr)} "
+        f"UEA={'on' if args.use_uea_pretrain else 'off'} (total={len(datasets)})"
+    )
 
-    reader = base.DataReader(UEA_data_path=args.uea_path, UCR_data_path=args.ucr_path)
-
-    # Combine UCR and UEA datasets (keep original list selection)
-    datasets = sorted(reader.dataset_list_ucr)
-
+    # Split datasets into train/val for meta-pretraining
     train_datasets = datasets
     val_datasets = []
-    if (not args.no_adapter) and args.val_ratio > 0:
+    if not args.no_adapter and args.val_ratio > 0:
         rng = random.Random(args.seed)
         shuffled = datasets.copy()
         rng.shuffle(shuffled)
@@ -207,188 +1174,293 @@ def main():
         val_datasets = sorted(shuffled[:val_count])
         train_datasets = sorted(shuffled[val_count:]) if val_count > 0 else datasets
         print(f"Meta split: train={len(train_datasets)}, val={len(val_datasets)} (val_ratio={args.val_ratio})")
+    
+    #--- Pretraining Phase ---
+    # if not args.no_adapter:
+    #     print(f"Starting Pretraining on {len(train_datasets)} datasets for {args.epochs} epochs...")
+    #     optimizer = optim.AdamW(model.adapter.parameters(), lr=args.lr, weight_decay=1e-4)
+    #     # optimizer = torch.optim.AdamW([
+    #     #     {"params": model.adapter.fc1.parameters(), "lr": 1e-4, "weight_decay": 0.0},
+    #     #     {"params": model.adapter.fc2.parameters(), "lr": 1e-4, "weight_decay": 0.0},
+    #     #    # {"params": [model.adapter.alpha],         "lr": 1e-5, "weight_decay": 0.0},
+    #     # ])
+    #     criterion = nn.CrossEntropyLoss()
 
-    # --- Pretraining Phase ---
-    if not args.no_adapter:
-        print(
-            f"Starting Pretraining (single-channel sampling) on {len(train_datasets)} datasets for {args.epochs} epochs..."
-        )
-        optimizer = optim.AdamW(model.adapter.parameters(), lr=args.lr, weight_decay=1e-4)
-        criterion = nn.CrossEntropyLoss()
+    #     os.makedirs(args.ckpt_dir, exist_ok=True)
+    #     best_val = float("inf")
+    #     best_epoch = -1
+        
+    #     for epoch in range(args.epochs):
+    #         random.shuffle(train_datasets)
+    #         epoch_loss = 0.0
+    #         count = 0
+            
+    #         # Create batches
+    #         num_batches = (len(train_datasets) + args.meta_batch_size - 1) // args.meta_batch_size
+            
+    #         pbar = tqdm(range(num_batches), desc=f"Epoch {epoch+1}/{args.epochs}")
+    #         for i in pbar:
+    #             batch_names = train_datasets[i*args.meta_batch_size : (i+1)*args.meta_batch_size]
+                
+    #             batch_data = []
+    #             for name in batch_names:
+    #                 is_uea = name in reader.dataset_list_uea
+    #                 X_tr, y_tr, X_te, y_te = load_dataset_data(
+    #                     reader,
+    #                     name,
+    #                     is_uea=is_uea,
+    #                     use_var_selector=args.use_var_selector,
+    #                     var_num_channels=args.var_num_channels,
+    #                 )
+    #                 if X_tr is not None:
+    #                     if args.pretrain_flatten_channels:
+    #                         X_tr, y_tr = _flatten_multichannel_as_single_channel(X_tr, y_tr)
+    #                         X_te, y_te = _flatten_multichannel_as_single_channel(X_te, y_te)
+    #                     batch_data.append((X_tr, y_tr, X_te, y_te))
+                
+    #             if not batch_data:
+    #                 continue
+                
+    #             try:
+    #                 loss = train_step(model, optimizer, criterion, batch_data, device, args)
+    #                 epoch_loss += loss
+    #                 count += 1
+    #                 pbar.set_postfix({'avg_loss': epoch_loss / count if count > 0 else 0})
+    #             except RuntimeError as e:
+    #                 if "out of memory" in str(e):
+    #                     print(f"\nSkipping batch due to OOM")
+    #                     torch.cuda.empty_cache()
+    #                     continue
+    #                 else:
+    #                     raise e
 
-        os.makedirs(args.ckpt_dir, exist_ok=True)
-        best_val = float("inf")
-        best_epoch = -1
+    #         avg_train_loss = epoch_loss / count if count > 0 else 0.0
 
-        for epoch in range(args.epochs):
-            random.shuffle(train_datasets)
-            epoch_loss = 0.0
-            count = 0
+    #         # Validation
+    #         avg_val_loss = None
+    #         if val_datasets:
+    #             val_loss_sum = 0.0
+    #             val_steps = 0
+    #             num_val_batches = (len(val_datasets) + args.meta_batch_size - 1) // args.meta_batch_size
+    #             for i in tqdm(range(num_val_batches), desc=f"Val {epoch+1}/{args.epochs}", leave=False):
+    #                 batch_names = val_datasets[i*args.meta_batch_size : (i+1)*args.meta_batch_size]
+    #                 batch_data = []
+    #                 for name in batch_names:
+    #                     is_uea = name in reader.dataset_list_uea
+    #                     X_tr, y_tr, X_te, y_te = load_dataset_data(
+    #                         reader,
+    #                         name,
+    #                         is_uea=is_uea,
+    #                         use_var_selector=args.use_var_selector,
+    #                         var_num_channels=args.var_num_channels,
+    #                     )
+    #                     if X_tr is not None:
+    #                         if args.pretrain_flatten_channels:
+    #                             X_tr, y_tr = _flatten_multichannel_as_single_channel(X_tr, y_tr)
+    #                             X_te, y_te = _flatten_multichannel_as_single_channel(X_te, y_te)
+    #                         batch_data.append((X_tr, y_tr, X_te, y_te))
+    #                 if not batch_data:
+    #                     continue
+    #                 try:
+    #                     vloss = validate_step(model, criterion, batch_data, device, args)
+    #                     if vloss is None:
+    #                         continue
+    #                     val_loss_sum += vloss
+    #                     val_steps += 1
+    #                 except RuntimeError as e:
+    #                     if "out of memory" in str(e):
+    #                         torch.cuda.empty_cache()
+    #                         continue
+    #                     raise e
+    #             avg_val_loss = val_loss_sum / val_steps if val_steps > 0 else None
 
-            num_batches = (len(train_datasets) + args.meta_batch_size - 1) // args.meta_batch_size
-            pbar = tqdm(range(num_batches), desc=f"Epoch {epoch+1}/{args.epochs}")
+    #         # Save checkpoints
+    #         ckpt_common = {
+    #             "epoch": epoch,
+    #             "adapter_state_dict": copy.deepcopy(model.adapter.state_dict()),
+    #             "optimizer_state_dict": copy.deepcopy(optimizer.state_dict()),
+    #             "train_loss": avg_train_loss,
+    #             "val_loss": avg_val_loss,
+    #             "best_val_loss": best_val,
+    #             "best_epoch": best_epoch,
+    #             "config": vars(args),
+    #             "run_tag": run_tag,
+    #             "tabicl_ckpt": args.tabicl_ckpt,
+    #             "mantis_ckpt": args.mantis_ckpt,
+    #             "seed": args.seed,
+    #         }
 
-            for i in pbar:
-                batch_names = train_datasets[i * args.meta_batch_size : (i + 1) * args.meta_batch_size]
+    #         if args.save_last:
+    #             last_path = os.path.join(args.ckpt_dir, f"{ckpt_base}_last.pt")
+    #             torch.save(ckpt_common, last_path)
 
-                batch_data = []
-                for name in batch_names:
-                    is_uea = name in reader.dataset_list_uea
-                    X_tr, y_tr, X_te, y_te = load_dataset_data_pretrain_v2(
-                        reader,
-                        name,
-                        is_uea=is_uea,
-                        use_var_selector=args.use_var_selector,
-                        var_num_channels=args.var_num_channels,
-                    )
-                    if X_tr is not None:
-                        batch_data.append((X_tr, y_tr, X_te, y_te))
-
-                if not batch_data:
-                    continue
-
-                try:
-                    loss = base.train_step(model, optimizer, criterion, batch_data, device, args)
-                    epoch_loss += loss
-                    count += 1
-                    pbar.set_postfix({"avg_loss": epoch_loss / count if count > 0 else 0})
-                except RuntimeError as e:
-                    if "out of memory" in str(e):
-                        print("\nSkipping batch due to OOM")
-                        torch.cuda.empty_cache()
-                        continue
-                    raise
-
-            avg_train_loss = epoch_loss / count if count > 0 else 0.0
-
-            # Validation (also uses single-channel sampling)
-            avg_val_loss = None
-            if val_datasets:
-                val_loss_sum = 0.0
-                val_steps = 0
-                num_val_batches = (len(val_datasets) + args.meta_batch_size - 1) // args.meta_batch_size
-                for i in tqdm(range(num_val_batches), desc=f"Val {epoch+1}/{args.epochs}", leave=False):
-                    batch_names = val_datasets[i * args.meta_batch_size : (i + 1) * args.meta_batch_size]
-                    batch_data = []
-                    for name in batch_names:
-                        is_uea = name in reader.dataset_list_uea
-                        X_tr, y_tr, X_te, y_te = load_dataset_data_pretrain_v2(
-                            reader,
-                            name,
-                            is_uea=is_uea,
-                            use_var_selector=args.use_var_selector,
-                            var_num_channels=args.var_num_channels,
-                        )
-                        if X_tr is not None:
-                            batch_data.append((X_tr, y_tr, X_te, y_te))
-                    if not batch_data:
-                        continue
-                    try:
-                        vloss = base.validate_step(model, criterion, batch_data, device, args)
-                        if vloss is None:
-                            continue
-                        val_loss_sum += vloss
-                        val_steps += 1
-                    except RuntimeError as e:
-                        if "out of memory" in str(e):
-                            torch.cuda.empty_cache()
-                            continue
-                        raise
-                avg_val_loss = val_loss_sum / val_steps if val_steps > 0 else None
-
-            ckpt_common = {
-                "epoch": epoch,
-                "adapter_state_dict": copy.deepcopy(model.adapter.state_dict()),
-                "optimizer_state_dict": copy.deepcopy(optimizer.state_dict()),
-                "train_loss": avg_train_loss,
-                "val_loss": avg_val_loss,
-                "best_val_loss": best_val,
-                "best_epoch": best_epoch,
-                "config": vars(args),
-                "run_tag": run_tag,
-                "tabicl_ckpt": args.tabicl_ckpt,
-                "mantis_ckpt": args.mantis_ckpt,
-                "seed": args.seed,
-+                "pretrain_sampling": "flatten_channels_to_single_channel",
-            }
-
-            if args.save_last:
-                last_path = os.path.join(args.ckpt_dir, f"{ckpt_base}_last.pt")
-                torch.save(ckpt_common, last_path)
-
-            if avg_val_loss is not None and avg_val_loss < best_val:
-                best_val = avg_val_loss
-                best_epoch = epoch
-                best_path = os.path.join(args.ckpt_dir, f"{ckpt_base}_best.pt")
-                ckpt_best = dict(ckpt_common)
-                ckpt_best["best_val_loss"] = best_val
-                ckpt_best["best_epoch"] = best_epoch
-                torch.save(ckpt_best, best_path)
-                print(f"Saved best checkpoint: {best_path} (val_loss={best_val:.6f})")
-            elif not val_datasets:
-                train_path = os.path.join(args.ckpt_dir, f"{ckpt_base}_best_trainloss.pt")
-                torch.save(ckpt_common, train_path)
-                print(f"Saved checkpoint (no val): {train_path} (train_loss={avg_train_loss:.6f})")
-            else:
-                if avg_val_loss is not None:
-                    print(
-                        f"Epoch {epoch+1}: train_loss={avg_train_loss:.6f}, val_loss={avg_val_loss:.6f}, best_val={best_val:.6f}"
-                    )
-                else:
-                    print(f"Epoch {epoch+1}: train_loss={avg_train_loss:.6f}, val_loss=N/A, best_val={best_val:.6f}")
-
-        print("Pretraining finished.")
-
-    # --- Evaluation Phase (unchanged; no channel-flattening) ---
+    #         if avg_val_loss is not None and avg_val_loss < best_val:
+    #             best_val = avg_val_loss
+    #             best_epoch = epoch
+    #             best_path = os.path.join(args.ckpt_dir, f"{ckpt_base}_best.pt")
+    #             ckpt_best = dict(ckpt_common)
+    #             ckpt_best["best_val_loss"] = best_val
+    #             ckpt_best["best_epoch"] = best_epoch
+    #             torch.save(ckpt_best, best_path)
+    #             print(f"Saved best checkpoint: {best_path} (val_loss={best_val:.6f})")
+    #         elif not val_datasets:
+    #             # If no validation, save best by train loss
+    #             train_path = os.path.join(args.ckpt_dir, f"{ckpt_base}_best_trainloss.pt")
+    #             torch.save(ckpt_common, train_path)
+    #             print(f"Saved checkpoint (no val): {train_path} (train_loss={avg_train_loss:.6f})")
+    #         else:
+    #             if avg_val_loss is not None:
+    #                 print(f"Epoch {epoch+1}: train_loss={avg_train_loss:.6f}, val_loss={avg_val_loss:.6f}, best_val={best_val:.6f}")
+    #             else:
+    #                 print(f"Epoch {epoch+1}: train_loss={avg_train_loss:.6f}, val_loss=N/A, best_val={best_val:.6f}")
+        
+    #     print("Pretraining finished.")
+    
+    # --- Evaluation Phase ---
     print("Starting Evaluation...")
-    results: dict[str, float] = {}
+    results = {}
 
+    # Track which adapter checkpoint was selected/loaded during evaluation (for JSON logging)
+    eval_ckpt_to_load = None
+    eval_ckpt_loaded = False
+    eval_adapter_name = model.adapter.__class__.__name__ if (model.adapter is not None) else None
+
+    # Load best adapter weights for evaluation (if adapter is enabled)
     if (not args.no_adapter) and (model.adapter is not None):
         ckpt_to_load = None
         if args.eval_adapter_ckpt:
             ckpt_to_load = args.eval_adapter_ckpt
         else:
             adapter_name = model.adapter.__class__.__name__
-            ckpt_to_load = base._find_latest_ckpt(
+            ckpt_to_load = _find_latest_ckpt(
                 args.ckpt_dir,
                 patterns=[
                     f"*{adapter_name}*_best.pt",
                     f"*{adapter_name}*_best_trainloss.pt",
                     f"*{adapter_name}*_last.pt",
-                    "*_best.pt",
-                    "*_best_trainloss.pt",
-                    "*_last.pt",
+                    # "*_best.pt",
+                    # "*_best_trainloss.pt",
+                    # "*_last.pt",
                 ],
             )
 
+        eval_ckpt_to_load = ckpt_to_load
+        eval_adapter_name = model.adapter.__class__.__name__
+
         if ckpt_to_load is not None and os.path.isfile(ckpt_to_load):
-            ckpt = torch.load(ckpt_to_load, map_location="cpu")
+            ckpt = torch.load("/data0/fangjuntao2025/tabicl-main/checkpoints/mantis_adapter_pretrainNew/adapter_CALDA_AdapterV2_20260104_143717_best.pt", map_location="cpu")
             adapter_state = ckpt.get("adapter_state_dict", ckpt)
             model.adapter.load_state_dict(adapter_state)
             model.adapter.to(device)
+            eval_ckpt_loaded = True
             print(f"[Eval] Loaded adapter weights: {ckpt_to_load}")
         else:
             print("[Eval] No adapter checkpoint found; using current adapter weights.")
 
-    infer_feat_shuffle_method = "none" if args.infer_no_feat_shuffle else "latin"
-    if args.infer_no_feat_shuffle:
-        print("[Eval] TabICLClassifier: feature shuffle disabled (feat_shuffle_method='none').")
+    if getattr(args, "infer_no_feat_shuffle", False):
+        print("[Eval] Note: TabICLClassifier is not used; --infer_no_feat_shuffle has no effect.")
 
-    clf = base.TabICLClassifier(
-        model_path=args.tabicl_ckpt,
-        n_estimators=32,
-        feat_shuffle_method=infer_feat_shuffle_method,
-        device=device,
-        verbose=False,
-        mantis_checkpoint=None,
-        batch_size=8,
+    def _eval_with_tabicl_icl(
+        *,
+        model: MantisAdapterTabICL,
+        X_train: torch.Tensor,
+        y_train: torch.Tensor,
+        X_test: torch.Tensor,
+        y_test: torch.Tensor,
+        device: torch.device,
+        args,
+    ) -> float | None:
+        """Evaluate one dataset using direct TabICL ICL inference (no TabICLClassifier).
+
+        Procedure:
+        - Extract embeddings for all train/test samples.
+        - Use the full training set as context (no sampling).
+        - Map labels to contiguous IDs [0..K-1].
+        - Run TabICL once on the concatenated sequence [train + test].
+        - Take argmax over query logits.
+
+        Note:
+        - This intentionally does NOT enforce args.max_icl_len. It assumes GPU memory is sufficient.
+        """
+        if X_train is None or X_test is None:
+            return None
+        if y_train is None or y_test is None:
+            return None
+
+        # Extract embeddings (numpy -> torch)
+        X_train_emb = get_embeddings(model, X_train, device)
+        X_test_emb = get_embeddings(model, X_test, device)
+        if X_train_emb is None or X_test_emb is None:
+            return None
+
+        X_train_emb_t = torch.from_numpy(X_train_emb).to(device=device, dtype=torch.float32)
+        X_test_emb_t = torch.from_numpy(X_test_emb).to(device=device, dtype=torch.float32)
+
+        y_train_cpu = y_train.detach().cpu().long()
+        y_test_cpu = y_test.detach().cpu().long()
+
+        uniq = torch.unique(y_train_cpu)
+        if uniq.numel() < 2:
+            return None
+
+        # Build a stable contiguous label mapping based on full train labels.
+        label_list = uniq.tolist()
+        label_to_idx = {int(lbl): int(i) for i, lbl in enumerate(label_list)}
+
+        y_train_mapped_full = torch.tensor(
+            [label_to_idx.get(int(v), -1) for v in y_train_cpu.tolist()],
+            dtype=torch.long,
+            device=device,
+        )
+        if (y_train_mapped_full < 0).any():
+            return None
+
+        y_test_mapped = torch.tensor(
+            [label_to_idx.get(int(v), -1) for v in y_test_cpu.tolist()],
+            dtype=torch.long,
+            device=device,
+        )
+        valid = (y_test_mapped >= 0)
+        if not valid.any():
+            return None
+
+        X_seq = torch.cat([X_train_emb_t, X_test_emb_t], dim=0).unsqueeze(0)  # (1, L, D)
+        y_sup_in = y_train_mapped_full.unsqueeze(0)  # (1, train_len)
+
+        with torch.no_grad():
+            # IMPORTANT:
+            # Use TabICL inference forward (supports hierarchical classification when num_classes > max_classes).
+            # _tabicl_train_forward uses a fixed max_classes head and is not suitable here.
+            logits_qry = model.tabicl_model._inference_forward(
+                X_seq,
+                y_sup_in,
+                feature_shuffles=None,
+                embed_with_test=False,
+                return_logits=True,
+                inference_config=None,
+            )  # (1, test_len, num_classes)
+            pred = logits_qry.argmax(dim=-1).squeeze(0)  # (qry_len,)
+
+        y_pred = pred[valid]
+        y_tgt = y_test_mapped[valid]
+        if y_tgt.numel() == 0:
+            return None
+        acc = float((y_pred == y_tgt).float().mean().item())
+        return acc
+    
+    # Dataset selection for evaluation
+    if args.use_uea_eval:
+        all_datasets = sorted(reader.dataset_list_ucr + reader.dataset_list_uea)
+    else:
+        all_datasets = sorted(reader.dataset_list_ucr)
+    print(
+        f"[Data] Eval datasets: UCR={len(reader.dataset_list_ucr)} "
+        f"UEA={'on' if args.use_uea_eval else 'off'} (total={len(all_datasets)})"
     )
-
-    all_datasets = sorted(reader.dataset_list_ucr)
     for dataset_name in tqdm(all_datasets, desc="Evaluating"):
         try:
             is_uea = dataset_name in reader.dataset_list_uea
-            X_train, y_train, X_test, y_test = base.load_dataset_data(
+            X_train, y_train, X_test, y_test = load_dataset_data(
                 reader,
                 dataset_name,
                 is_uea=is_uea,
@@ -398,28 +1470,34 @@ def main():
             if X_train is None:
                 continue
 
-            X_train_emb = base.get_embeddings(model, X_train, device)
-            X_test_emb = base.get_embeddings(model, X_test, device)
-
-            clf.fit(X_train_emb, y_train.numpy())
-            y_pred = clf.predict(X_test_emb)
-            acc = float(np.mean(y_pred == y_test.numpy()))
-            results[dataset_name] = acc
+            acc = _eval_with_tabicl_icl(
+                model=model,
+                X_train=X_train,
+                y_train=y_train,
+                X_test=X_test,
+                y_test=y_test,
+                device=device,
+                args=args,
+            )
+            if acc is None:
+                continue
+            results[dataset_name] = float(acc)
         except RuntimeError as e:
             if "out of memory" in str(e):
                 print(f"\nSkipping {dataset_name} due to OOM")
                 torch.cuda.empty_cache()
                 continue
-            raise
+            else:
+                raise e
         except Exception as e:
             print(f"\nError evaluating {dataset_name}: {e}")
             continue
 
     print("\nFinal Results:")
-
+    
     uea_results = {name: acc for name, acc in results.items() if name in reader.dataset_list_uea}
     ucr_results = {name: acc for name, acc in results.items() if name in reader.dataset_list_ucr}
-
+    
     if uea_results:
         print(f"\n--- UEA Benchmark ({len(uea_results)} datasets) ---")
         for name in sorted(uea_results.keys()):
@@ -431,17 +1509,58 @@ def main():
         for name in sorted(ucr_results.keys()):
             print(f"{name}: {ucr_results[name]:.4f}")
         print(f"Average UCR Accuracy: {np.mean(list(ucr_results.values())):.4f}")
-
-    if results:
-        print(f"\nOverall Average Accuracy: {np.mean(list(results.values())):.4f}")
+        
+    print(f"\nOverall Average Accuracy: {np.mean(list(results.values())):.4f}")
 
     if args.output_file:
+        # Create directory if it doesn't exist
         os.makedirs(os.path.dirname(os.path.abspath(args.output_file)), exist_ok=True)
-        structured_results = {"UEA": uea_results, "UCR": ucr_results}
-        with open(args.output_file, "w") as f:
+        
+        # Save structured results separating UEA and UCR
+        structured_results = {
+            "UEA": uea_results,
+            "UCR": ucr_results
+        }
+        
+        with open(args.output_file, 'w') as f:
             json.dump(structured_results, f, indent=4)
         print(f"Results saved to {args.output_file}")
 
+    # Append experiment results into the same args JSON log file
+    if args_log_path is not None:
+        try:
+            payload = args_payload if isinstance(args_payload, dict) else {}
+            payload["results"] = {
+                "UEA": uea_results,
+                "UCR": ucr_results,
+            }
+            payload["eval"] = {
+                "adapter_name": eval_adapter_name,
+                "ckpt_to_load": eval_ckpt_to_load,
+                "ckpt_loaded": bool(eval_ckpt_loaded),
+                "ckpt_dir": getattr(args, "ckpt_dir", None),
+                "eval_adapter_ckpt_arg": getattr(args, "eval_adapter_ckpt", None),
+            }
+            payload["metrics"] = {
+                "avg_uea_acc": float(np.mean(list(uea_results.values()))) if uea_results else None,
+                "avg_ucr_acc": float(np.mean(list(ucr_results.values()))) if ucr_results else None,
+                "overall_avg_acc": float(np.mean(list(results.values()))) if results else None,
+                "num_datasets": int(len(results)),
+                "num_uea": int(len(uea_results)),
+                "num_ucr": int(len(ucr_results)),
+                "use_uea_pretrain": bool(getattr(args, "use_uea_pretrain", True)),
+                "use_uea_eval": bool(getattr(args, "use_uea_eval", True)),
+            }
+            payload["data"] = {
+                "eval_dataset_scope": "UCR+UEA" if getattr(args, "use_uea_eval", True) else "UCR",
+                "pretrain_dataset_scope": "UCR+UEA" if getattr(args, "use_uea_pretrain", True) else "UCR",
+            }
+            payload["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(args_log_path, "w") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+            print(f"[Run] Updated args log with results: {args_log_path}")
+        except Exception as e:
+            print(f"[Run][warn] Failed to update args log with results: {e}")
 
 if __name__ == "__main__":
     main()

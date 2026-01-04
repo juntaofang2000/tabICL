@@ -29,7 +29,8 @@ def run_comparison():
         "--epochs", "10",
         "--lr", "1e-3",
         "--div_weight", "0.1",
-        "--mantis_batch_size", "8"
+        "--mantis_batch_size", "16",
+        "--seed", "42"
     ]
     
     # Command 1: Adapter (Train)
@@ -80,59 +81,101 @@ def run_comparison():
     with open(baseline_output, 'r') as f:
         res_baseline = json.load(f)
         
-    # Comparison Logic
-    datasets = sorted(list(set(res_adapter.keys()) | set(res_baseline.keys())))
-    
-    better = []
-    worse = []
-    same = []
-    
     lines = []
-    lines.append("="*50)
+    lines.append("="*80)
     lines.append(f"Adapter vs Baseline Comparison Report ({timestamp})")
-    lines.append("="*50)
-    lines.append(f"{'Dataset':<40} | {'Adapter':<10} | {'Baseline':<10} | {'Diff':<10}")
-    lines.append("-" * 80)
-    
-    adapter_vals = []
-    baseline_vals = []
-    
-    for ds in datasets:
-        acc_a = res_adapter.get(ds, 0.0)
-        acc_b = res_baseline.get(ds, 0.0)
-        diff = acc_a - acc_b
-        
-        adapter_vals.append(acc_a)
-        baseline_vals.append(acc_b)
-        
-        lines.append(f"{ds:<40} | {acc_a:.4f}     | {acc_b:.4f}     | {diff:+.4f}")
-        
-        if diff > 0.0001:
-            better.append((ds, diff))
-        elif diff < -0.0001:
-            worse.append((ds, diff))
-        else:
-            same.append(ds)
+    lines.append("="*80)
+
+    def process_benchmark(name, adapter_dict, baseline_dict):
+        if not adapter_dict and not baseline_dict:
+            return None
             
-    lines.append("-" * 80)
-    lines.append(f"Overall Average Adapter:  {np.mean(adapter_vals):.4f}")
-    lines.append(f"Overall Average Baseline: {np.mean(baseline_vals):.4f}")
-    lines.append(f"Overall Improvement:      {np.mean(adapter_vals) - np.mean(baseline_vals):+.4f}")
-    lines.append("=" * 50)
+        datasets = sorted(list(set(adapter_dict.keys()) | set(baseline_dict.keys())))
+        
+        lines.append(f"\n--- {name} Benchmark ({len(datasets)} datasets) ---")
+        lines.append(f"{'Dataset':<40} | {'Adapter':<10} | {'Baseline':<10} | {'Diff':<10}")
+        lines.append("-" * 80)
+        
+        vals_a = []
+        vals_b = []
+        better = []
+        worse = []
+        same = []
+        
+        for ds in datasets:
+            acc_a = adapter_dict.get(ds, 0.0)
+            acc_b = baseline_dict.get(ds, 0.0)
+            diff = acc_a - acc_b
+            
+            vals_a.append(acc_a)
+            vals_b.append(acc_b)
+            
+            lines.append(f"{ds:<40} | {acc_a:.4f}     | {acc_b:.4f}     | {diff:+.4f}")
+            
+            if diff > 0.0001:
+                better.append((ds, diff))
+            elif diff < -0.0001:
+                worse.append((ds, diff))
+            else:
+                same.append(ds)
+        
+        avg_a = np.mean(vals_a) if vals_a else 0.0
+        avg_b = np.mean(vals_b) if vals_b else 0.0
+        
+        lines.append("-" * 80)
+        lines.append(f"Average {name} Adapter:  {avg_a:.4f}")
+        lines.append(f"Average {name} Baseline: {avg_b:.4f}")
+        lines.append(f"Average {name} Diff:     {avg_a - avg_b:+.4f}")
+        
+        return {
+            "vals_a": vals_a, "vals_b": vals_b,
+            "better": better, "worse": worse, "same": same
+        }
+
+    # Handle nested structure from train_adapter.py
+    # Structure is expected to be {"UEA": {...}, "UCR": {...}}
+    uea_stats = process_benchmark("UEA", res_adapter.get("UEA", {}), res_baseline.get("UEA", {}))
+    ucr_stats = process_benchmark("UCR", res_adapter.get("UCR", {}), res_baseline.get("UCR", {}))
     
-    lines.append(f"\nSummary:")
-    lines.append(f"Adapter Better: {len(better)} datasets")
-    lines.append(f"Adapter Worse:  {len(worse)} datasets")
-    lines.append(f"Same:           {len(same)} datasets")
+    # Overall Summary
+    lines.append("\n" + "="*80)
+    lines.append("FINAL SUMMARY")
+    lines.append("="*80)
     
+    all_vals_a = []
+    all_vals_b = []
+    all_better = []
+    all_worse = []
+    
+    if uea_stats:
+        all_vals_a.extend(uea_stats["vals_a"])
+        all_vals_b.extend(uea_stats["vals_b"])
+        all_better.extend(uea_stats["better"])
+        all_worse.extend(uea_stats["worse"])
+        
+    if ucr_stats:
+        all_vals_a.extend(ucr_stats["vals_a"])
+        all_vals_b.extend(ucr_stats["vals_b"])
+        all_better.extend(ucr_stats["better"])
+        all_worse.extend(ucr_stats["worse"])
+        
+    if all_vals_a:
+        avg_a = np.mean(all_vals_a)
+        avg_b = np.mean(all_vals_b)
+        lines.append(f"Overall Average Adapter:  {avg_a:.4f}")
+        lines.append(f"Overall Average Baseline: {avg_b:.4f}")
+        lines.append(f"Overall Improvement:      {avg_a - avg_b:+.4f}")
+        lines.append(f"Total Better: {len(all_better)}")
+        lines.append(f"Total Worse:  {len(all_worse)}")
+        
     lines.append("\nTop Improvements (Adapter > Baseline):")
-    for ds, diff in sorted(better, key=lambda x: x[1], reverse=True)[:10]:
+    for ds, diff in sorted(all_better, key=lambda x: x[1], reverse=True)[:10]:
         lines.append(f"  {ds}: {diff:+.4f}")
         
     lines.append("\nTop Regressions (Adapter < Baseline):")
-    for ds, diff in sorted(worse, key=lambda x: x[1])[:10]:
+    for ds, diff in sorted(all_worse, key=lambda x: x[1])[:10]:
         lines.append(f"  {ds}: {diff:+.4f}")
-        
+
     report_text = "\n".join(lines)
     print(report_text)
     
