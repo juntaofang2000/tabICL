@@ -20,7 +20,7 @@ import copy
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../"))
 
 from tabicl.model.mantis_tabicl import MantisTabICL, build_mantis_encoder
-from tabicl.model.adapterOrign import CALDA_Adapter, CALDA_AdapterV2, DistributionDiversityLoss,ChannelMLPConcatAdapter, SafeResidualAdapter,LoRAResidualAdapter,CausalChannelAdapter
+from tabicl.model.adapterOrign import CALDA_Adapter, CALDA_AdapterV2, CALDAMLP_AdapterV2, DistributionDiversityLoss,ChannelMLPConcatAdapter, SafeResidualAdapter,LoRAResidualAdapter,CausalChannelAdapter
 from tabicl.prior.data_reader import DataReader
 from tabicl.model.tabicl import TabICL
 from tabicl.sklearn.classifier import TabICLClassifier
@@ -955,7 +955,7 @@ def main():
         "use_uea_eval",
         default=True,
         help_text="Whether to include UEA benchmark datasets during evaluation/inference.",
-    )
+    )#  --no-use_uea_eval False
 
     parser.add_argument(
         "--pretrain_flatten_channels",
@@ -971,7 +971,7 @@ def main():
         "--adapter_type",
         type=str,
         default="calda",
-        choices=["none", "calda", "calda_v2", "channel_mlp_concat", "safe_residual", "sca","lora_residual","cca"],
+        choices=["none", "calda", "calda_v2", "channel_mlp_concat", "safe_residual", "sca","lora_residual","cca","mlp_v2"],
         help=(
             "Which adapter to use when not --no_adapter. "
             "none: disable adapter; calda: CALDA_Adapter; calda_v2: per-channel CALDA with concat then projection; "
@@ -1082,6 +1082,13 @@ def main():
                 tabicl_input_dim=tabicl_dim,
                 # out_dim=tabicl_dim,
             ).to(device)
+        
+        if args.adapter_type == "mlp_v2":
+                return CALDAMLP_AdapterV2(
+                mantis_emb_dim=mantis_dim,
+                tabicl_input_dim=tabicl_dim,
+                # out_dim=tabicl_dim,
+            ).to(device)
 
         if args.adapter_type == "channel_mlp_concat":
             return ChannelMLPConcatAdapter(
@@ -1108,6 +1115,8 @@ def main():
             return LoRAResidualAdapter(dim=mantis_dim, rank=8, dropout=0.0, fuse="mean").to(device)
         if args.adapter_type == "cca":   
             return CausalChannelAdapter(mantis_emb_dim=mantis_dim, tabicl_input_dim=256,num_latents=4).to(device)
+        
+        
         raise ValueError(f"Unknown adapter_type={args.adapter_type}")
 
     if args.mantis_fusion == "sum":
@@ -1360,7 +1369,7 @@ def main():
         print("[Eval] TabICLClassifier: feature shuffle disabled (feat_shuffle_method='none').")
     clf = TabICLClassifier(
         model_path=args.tabicl_ckpt,
-        n_estimators=32,
+        n_estimators=1,
         feat_shuffle_method=infer_feat_shuffle_method,
         device=device,
         verbose=False,
