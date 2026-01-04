@@ -5,11 +5,13 @@ import json
 import torch
 import numpy as np
 import random
+from pathlib import Path
 from torch import nn, optim
 from tqdm import tqdm
 
-# Add src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../"))
+# Add project src/ to path (so `import tabicl...` works when running as a script)
+_SRC_DIR = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(_SRC_DIR))
 
 from tabicl.model.mantis_tabicl import build_mantis_encoder
 from tabicl.model.adapter_channelconcat import ChannelWiseConcatAdapter
@@ -48,6 +50,35 @@ def resize_series(X, target_len=512):
         X_tensor, size=target_len, mode="linear", align_corners=False
     )
     return X_resized
+
+
+def split_train_valid(
+    X_train: torch.Tensor,
+    y_train: torch.Tensor,
+    valid_ratio: float,
+    seed: int,
+):
+    """Split a dataset train set into (train_subset, valid_subset) with shuffling."""
+    n = int(X_train.size(0))
+    if n < 2:
+        return X_train, y_train, None, None
+
+    valid_ratio = float(valid_ratio)
+    if not (0.0 < valid_ratio < 1.0):
+        raise ValueError(f"valid_ratio must be in (0,1), got {valid_ratio}")
+
+    n_valid = max(1, int(round(n * valid_ratio)))
+    if n - n_valid < 1:
+        n_valid = n - 1
+
+    g = torch.Generator()
+    g.manual_seed(int(seed))
+    perm = torch.randperm(n, generator=g)
+
+    valid_idx = perm[:n_valid]
+    train_idx = perm[n_valid:]
+
+    return X_train[train_idx], y_train[train_idx], X_train[valid_idx], y_train[valid_idx]
 
 
 class MantisAdapterTabICL(nn.Module):
@@ -133,6 +164,32 @@ def load_dataset_data(reader: DataReader, dataset_name: str):
     return X_train, y_train, X_test, y_test
 
 
+def load_dataset_data_with_valid(reader: DataReader, dataset_name: str, valid_ratio: float, seed: int):
+    X_train, y_train, X_test, y_test = load_dataset_data(reader, dataset_name)
+    if X_train is None:
+        return None, None, None, None, None, None
+
+    X_tr, y_tr, X_va, y_va = split_train_valid(X_train, y_train, valid_ratio=valid_ratio, seed=seed)
+    return X_tr, y_tr, X_va, y_va, X_test, y_test
+
+
+def _map_labels_by_support(y_support: torch.Tensor, y_query: torch.Tensor, device: torch.device):
+    """Map labels to 0..K-1 based on support classes; returns (y_sup_mapped, y_qry_mapped_safe, valid_mask)."""
+    unique_classes, inverse_indices = torch.unique(y_support, return_inverse=True)
+    y_sup_mapped = inverse_indices.to(device)
+
+    max_label = max(int(y_support.max().item()), int(y_query.max().item()))
+    mapper = torch.full((max_label + 1,), -1, dtype=torch.long, device=device)
+    mapper[unique_classes.to(device)] = torch.arange(len(unique_classes), device=device)
+
+    y_qry_mapped = mapper[y_query.to(device)]
+    valid_mask = y_qry_mapped != -1
+    y_qry_mapped_safe = y_qry_mapped.clone()
+    y_qry_mapped_safe[~valid_mask] = 0
+
+    return y_sup_mapped, y_qry_mapped_safe, valid_mask
+
+
 def get_embeddings(model: MantisAdapterTabICL, X_data, device, batch_size=64):
     """Get embeddings from Mantis + ChannelWiseConcatAdapter.
 
@@ -162,8 +219,13 @@ def train_step(model, optimizer, criterion, batch_datasets, device, args):
     model.train()
     optimizer.zero_grad()
 
-    min_train_len = min(d[0].size(0) for d in batch_datasets)
-    n_support = min(args.train_size, min_train_len)
+    # Ensure every task has at least 1 query sample.
+    # We therefore cap n_support by (min_train_len - 1).
+    min_train_len = min(int(d[0].size(0)) for d in batch_datasets)
+    if min_train_len < 2:
+        return 0.0
+
+    n_support = min(int(args.train_size), min_train_len - 1)
     if n_support < 1:
         return 0.0
 
@@ -172,32 +234,29 @@ def train_step(model, optimizer, criterion, batch_datasets, device, args):
     y_qry_mapped_list = []
     valid_mask_list = []
 
-    for X_train, y_train, X_test, y_test in batch_datasets:
+    for X_train, y_train in batch_datasets:
         X_sup = X_train[:n_support]
         y_sup = y_train[:n_support]
 
-        X_qry = torch.cat([X_train[n_support:], X_test], dim=0)
-        y_qry = torch.cat([y_train[n_support:], y_test], dim=0)
+        # IMPORTANT: training must NOT use the test set. Query comes from remaining train samples.
+        X_qry = X_train[n_support:]
+        y_qry = y_train[n_support:]
+
+        # With the n_support choice above, X_qry should always have >= 1.
+        if X_qry.size(0) < 1:
+            continue
 
         X_seq = torch.cat([X_sup, X_qry], dim=0)
         X_seq_list.append(X_seq)
 
-        unique_classes, inverse_indices = torch.unique(y_sup, return_inverse=True)
-        y_sup_mapped = inverse_indices.to(device)
-
-        max_label = max(y_sup.max(), y_qry.max()).item()
-        mapper = torch.full((max_label + 1,), -1, dtype=torch.long, device=device)
-        mapper[unique_classes] = torch.arange(len(unique_classes), device=device)
-
-        y_qry_mapped = mapper[y_qry.to(device)]
-        valid_mask = y_qry_mapped != -1
-
-        y_qry_mapped_safe = y_qry_mapped.clone()
-        y_qry_mapped_safe[~valid_mask] = 0
+        y_sup_mapped, y_qry_mapped_safe, valid_mask = _map_labels_by_support(y_sup, y_qry, device)
 
         y_sup_mapped_list.append(y_sup_mapped)
         y_qry_mapped_list.append(y_qry_mapped_safe)
         valid_mask_list.append(valid_mask)
+
+    if not X_seq_list:
+        return 0.0
 
     min_len = min(x.size(0) for x in X_seq_list)
     target_len = min(min_len, args.max_icl_len)
@@ -209,7 +268,9 @@ def train_step(model, optimizer, criterion, batch_datasets, device, args):
     y_qry_batch_list = []
     mask_batch_list = []
 
-    for i in range(len(batch_datasets)):
+    # Only iterate over tasks actually collected into X_seq_list.
+    num_tasks = len(X_seq_list)
+    for i in range(num_tasks):
         x_item = X_seq_list[i][:target_len]
         emb = model.get_adapter_output(x_item.unsqueeze(0))  # (1, L, D)
         adapter_out_list.append(emb.squeeze(0))
@@ -227,7 +288,7 @@ def train_step(model, optimizer, criterion, batch_datasets, device, args):
     aug_y_qry_list = []
     aug_mask_list = []
 
-    for i in range(len(batch_datasets)):
+    for i in range(num_tasks):
         emb = adapter_out[i].unsqueeze(0)
         y_sup = y_sup_batch_list[i].unsqueeze(0)
         y_qry = y_qry_batch_list[i].unsqueeze(0)
@@ -285,6 +346,67 @@ def train_step(model, optimizer, criterion, batch_datasets, device, args):
     return total_loss
 
 
+@torch.no_grad()
+def validate_epoch(model: MantisAdapterTabICL, valid_tasks, device: torch.device, args) -> float:
+    """Return mean valid accuracy over provided tasks.
+
+    valid_tasks: list of (X_train, y_train, X_valid, y_valid)
+    """
+    model.eval()
+
+    acc_list = []
+    for X_tr, y_tr, X_va, y_va in valid_tasks:
+        if X_tr is None or X_va is None:
+            continue
+
+        n_support = min(args.train_size, int(X_tr.size(0)))
+        if n_support < 1:
+            continue
+
+        X_sup = X_tr[:n_support]
+        y_sup = y_tr[:n_support]
+
+        X_qry = X_va
+        y_qry = y_va
+        if X_qry.size(0) < 1:
+            continue
+
+        # Build a single task sequence: [support, query]
+        X_seq = torch.cat([X_sup, X_qry], dim=0)
+        max_len = min(int(X_seq.size(0)), int(args.max_icl_len))
+        if max_len <= n_support:
+            continue
+
+        X_seq = X_seq[:max_len]
+        qry_len = max_len - n_support
+        y_qry = y_qry[:qry_len]
+
+        y_sup_mapped, y_qry_mapped_safe, valid_mask = _map_labels_by_support(y_sup, y_qry, device)
+        if not valid_mask.any():
+            continue
+
+        # (1, L, C, 512)
+        X_in = X_seq.unsqueeze(0).to(device)
+        logits = model.tabicl_model(model.get_adapter_output(X_in), y_sup_mapped.unsqueeze(0), return_logits=True)
+
+        # Align logits to query
+        if logits.size(1) == max_len:
+            logits_qry = logits[:, -qry_len:, :]
+        else:
+            logits_qry = logits
+
+        pred = logits_qry.argmax(dim=-1).squeeze(0)  # (qry_len,)
+        y_true = y_qry_mapped_safe
+        mask = valid_mask
+
+        correct = (pred[mask] == y_true[mask]).float().mean().item()
+        acc_list.append(correct)
+
+    if not acc_list:
+        return 0.0
+    return float(np.mean(acc_list))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
@@ -322,6 +444,21 @@ def main():
     parser.add_argument("--max_channels", type=int, default=30, help="Pad/truncate channels to this")
     parser.add_argument("--per_channel_dim", type=int, default=16, help="Per-channel projected dim before concat")
     parser.add_argument("--adapter_dropout", type=float, default=0.0)
+
+    # Validation / checkpointing
+    parser.add_argument("--valid_ratio", type=float, default=0.2, help="Split train into (train, valid)")
+    parser.add_argument(
+        "--valid_tasks_per_epoch",
+        type=int,
+        default=32,
+        help="How many datasets to sample for valid each epoch (0 = use all)",
+    )
+    parser.add_argument(
+        "--best_ckpt_path",
+        type=str,
+        default="/data0/fangjuntao2025/tabicl-main/checkpoints/channelconcat_best.pt",
+        help="Save best (by valid acc) adapter checkpoint here",
+    )
 
     parser.add_argument("--output_file", type=str, default=None)
 
@@ -365,6 +502,11 @@ def main():
     optimizer = optim.AdamW(model.adapter.parameters(), lr=args.lr, weight_decay=1e-4)
     criterion = nn.CrossEntropyLoss()
 
+    best_valid = -1.0
+    best_epoch = -1
+    best_ckpt_path = Path(args.best_ckpt_path)
+    best_ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+
     for epoch in range(args.epochs):
         random.shuffle(datasets)
         epoch_loss = 0.0
@@ -378,9 +520,11 @@ def main():
 
             batch_data = []
             for name in batch_names:
-                X_tr, y_tr, X_te, y_te = load_dataset_data(reader, name)
-                if X_tr is not None:
-                    batch_data.append((X_tr, y_tr, X_te, y_te))
+                X_tr, y_tr, X_va, y_va, _, _ = load_dataset_data_with_valid(
+                    reader, name, valid_ratio=args.valid_ratio, seed=args.seed + epoch
+                )
+                if X_tr is not None and X_tr.size(0) >= 2:
+                    batch_data.append((X_tr, y_tr))
 
             if not batch_data:
                 continue
@@ -397,7 +541,63 @@ def main():
                     continue
                 raise
 
+        # ---- Validation: pick best checkpoint by valid accuracy ----
+        valid_names = datasets
+        if args.valid_tasks_per_epoch and args.valid_tasks_per_epoch > 0:
+            valid_names = random.sample(datasets, k=min(len(datasets), args.valid_tasks_per_epoch))
+
+        valid_tasks = []
+        for name in valid_names:
+            X_tr, y_tr, X_va, y_va, _, _ = load_dataset_data_with_valid(
+                reader, name, valid_ratio=args.valid_ratio, seed=args.seed + 10000 + epoch
+            )
+            if X_tr is None or X_va is None:
+                continue
+            valid_tasks.append((X_tr, y_tr, X_va, y_va))
+
+        try:
+            valid_acc = validate_epoch(model, valid_tasks, device, args)
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print("\nValidation skipped due to OOM")
+                torch.cuda.empty_cache()
+                valid_acc = -1.0
+            else:
+                raise
+
+        print(
+            f"Epoch {epoch+1}: valid_acc={valid_acc:.4f} "
+            f"(best={best_valid:.4f} @ epoch {best_epoch+1 if best_epoch>=0 else 'n/a'})"
+        )
+        if valid_acc > best_valid:
+            best_valid = valid_acc
+            best_epoch = epoch
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "valid_acc": valid_acc,
+                    "adapter_state_dict": model.adapter.state_dict(),
+                    "adapter_config": {
+                        "max_channels": args.max_channels,
+                        "per_channel_dim": args.per_channel_dim,
+                        "dropout": args.adapter_dropout,
+                    },
+                    "args": vars(args),
+                },
+                str(best_ckpt_path),
+            )
+            print(f"Saved best checkpoint to {best_ckpt_path}")
+
     print("Pretraining finished.")
+
+    # Load best checkpoint before test evaluation
+    if best_ckpt_path.exists():
+        ckpt = torch.load(str(best_ckpt_path), map_location="cpu")
+        model.adapter.load_state_dict(ckpt["adapter_state_dict"])
+        model.adapter.to(device)
+        print(f"Loaded best adapter checkpoint from {best_ckpt_path} (valid_acc={ckpt.get('valid_acc', 'n/a')})")
+    else:
+        print(f"Warning: best checkpoint not found at {best_ckpt_path}; using last adapter weights")
 
     print("Starting Evaluation...")
     results = {}

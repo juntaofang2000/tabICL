@@ -277,6 +277,19 @@ def load_dataset_data(reader, dataset_name):
     return X_train, y_train, X_test, y_test
 
 
+def predict_in_chunks(clf, X_data, chunk_size):
+    """
+    Predict in chunks to avoid large memory allocations in TabICL inference.
+    """
+    if chunk_size is None or chunk_size <= 0 or X_data.shape[0] <= chunk_size:
+        return clf.predict(X_data)
+
+    preds = []
+    for i in range(0, X_data.shape[0], chunk_size):
+        preds.append(clf.predict(X_data[i : i + chunk_size]))
+    return np.concatenate(preds, axis=0)
+
+
 def _build_meta_tasks(model, batch_datasets, device, args):
     """
     Build augmented meta-learning tasks for adapter training/eval.
@@ -505,6 +518,9 @@ def main():
     parser.add_argument("--ckpt_dir", type=str, default="/data0/fangjuntao2025/tabicl-main/checkpoints/mantis_adapter_pretrain", help="Directory to save adapter checkpoints")
     parser.add_argument("--ckpt_prefix", type=str, default="adapter", help="Checkpoint filename prefix")
     parser.add_argument("--save_last", action="store_true", help="Also save last checkpoint each epoch")
+    parser.add_argument("--tabicl_n_estimators", type=int, default=32, help="Number of TabICL ensemble estimators for evaluation")
+    parser.add_argument("--tabicl_batch_size", type=int, default=1, help="TabICLClassifier batch size during evaluation")
+    parser.add_argument("--eval_chunk_size", type=int, default=128, help="Chunk size for evaluation predictions to avoid OOM")
     
     args = parser.parse_args()
     
@@ -674,15 +690,19 @@ def main():
     # --- Evaluation Phase ---
     print("Starting Evaluation...")
     results = {}
+
+    tabicl_n_estimators = getattr(args, "tabicl_n_estimators", 32)
+    tabicl_batch_size = getattr(args, "tabicl_batch_size", 1)
+    eval_chunk_size = getattr(args, "eval_chunk_size", 128)
     
     # Initialize Classifier for evaluation
     clf = TabICLClassifier(
         model_path=args.tabicl_ckpt,
-        n_estimators=32,
+        n_estimators=tabicl_n_estimators,
         device=device,
         verbose=False,
         mantis_checkpoint=None,
-        batch_size=8,
+        batch_size=tabicl_batch_size,
     )
     
     all_datasets = sorted(reader.dataset_list_ucr + reader.dataset_list_uea)
@@ -698,7 +718,7 @@ def main():
             
             # Fit and Predict
             clf.fit(X_train_emb, y_train.numpy())
-            y_pred = clf.predict(X_test_emb)
+            y_pred = predict_in_chunks(clf, X_test_emb, eval_chunk_size)
             acc = np.mean(y_pred == y_test.numpy())
             
             results[dataset_name] = acc

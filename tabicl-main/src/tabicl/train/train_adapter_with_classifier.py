@@ -539,7 +539,7 @@ def main():
     tabicl_model.to(device)
     
     # Initialize Adapter
-    tabicl_dim = 64
+    tabicl_dim = 256
     mantis_dim = mantis_model.hidden_dim
     
     print(f"Mantis Dim: {mantis_dim}, TabICL Dim: {tabicl_dim}")

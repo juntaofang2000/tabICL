@@ -4,99 +4,6 @@ import torch.nn.functional as F
 from typing import Dict, Literal, Optional, Tuple
 
 
-class CausalDisentanglerAdapter(nn.Module):
-    """Cross-attention based adapter for multivariate time-series channel embeddings.
-
-    Design goals:
-    - No pooling/summing over the source channel dimension.
-    - Learn a small set of latent queries that attend to source channels, producing
-      a fixed number of latent "feature columns".
-
-    Input:
-        x: (B, Source_Channels, Emb_Dim)
-    Output:
-        z: (B, Num_Latents, Emb_Dim)
-    """
-
-    def __init__(
-        self,
-        emb_dim: int,
-        num_latents: int = 10,
-        num_heads: int = 4,
-        dropout: float = 0.0,
-        norm: str = "bn",
-        use_affine_norm: bool = False,
-    ):
-        super().__init__()
-
-        if emb_dim % num_heads != 0:
-            raise ValueError(f"emb_dim ({emb_dim}) must be divisible by num_heads ({num_heads}).")
-
-        self.emb_dim = int(emb_dim)
-        self.num_latents = int(num_latents)
-        self.num_heads = int(num_heads)
-
-        self.latent_queries = nn.Parameter(torch.randn(1, self.num_latents, self.emb_dim) * 0.02)
-
-        self.cross_attn = nn.MultiheadAttention(
-            embed_dim=self.emb_dim,
-            num_heads=self.num_heads,
-            dropout=dropout,
-            batch_first=True,
-        )
-
-        # Output normalization: stabilize distribution for downstream TabICL augmentations.
-        # BatchNorm1d expects (N, C, L). We treat Emb_Dim as channels.
-        norm = (norm or "").lower()
-        if norm in {"bn", "batchnorm", "batchnorm1d"}:
-            self.out_norm = nn.BatchNorm1d(self.emb_dim, affine=use_affine_norm)
-            self._norm_kind = "bn"
-        elif norm in {"ln", "layernorm"}:
-            self.out_norm = nn.LayerNorm(self.emb_dim, elementwise_affine=use_affine_norm)
-            self._norm_kind = "ln"
-        elif norm in {"none", "", None}:
-            self.out_norm = nn.Identity()
-            self._norm_kind = "none"
-        else:
-            raise ValueError(f"Unknown norm='{norm}'. Use 'bn', 'ln', or 'none'.")
-
-        # A small residual MLP helps expressiveness without collapsing channels.
-        self.ffn = nn.Sequential(
-            nn.Linear(self.emb_dim, self.emb_dim * 4),
-            nn.GELU(),
-            nn.Linear(self.emb_dim * 4, self.emb_dim),
-        )
-        self.pre_norm = nn.LayerNorm(self.emb_dim)
-        self.post_norm = nn.LayerNorm(self.emb_dim)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.dim() != 3:
-            raise ValueError(f"Input must be (Batch, Source_Channels, Emb_Dim). Got shape {tuple(x.shape)}")
-        if x.size(-1) != self.emb_dim:
-            raise ValueError(
-                f"Last dim mismatch: expected Emb_Dim={self.emb_dim}, got {x.size(-1)}."
-            )
-
-        B = x.size(0)
-        q = self.latent_queries.expand(B, -1, -1)  # (B, Num_Latents, Emb_Dim)
-
-        # Cross-attention: Query=latent queries, Key/Value=source channels.
-        # No pooling over channels; attention learns to extract causal latents.
-        attn_out, _ = self.cross_attn(query=q, key=x, value=x, need_weights=False)
-
-        # Residual + FFN (Transformer-style)
-        z = self.pre_norm(attn_out)
-        z = z + self.ffn(z)
-        z = self.post_norm(z)
-
-        # Distribution alignment normalization
-        if self._norm_kind == "bn":
-            # (B, Num_Latents, Emb_Dim) -> (B, Emb_Dim, Num_Latents)
-            z = self.out_norm(z.transpose(1, 2)).transpose(1, 2)
-        else:
-            z = self.out_norm(z)
-
-        return z
 
 
 class CausalGNNLayer(nn.Module):
@@ -134,15 +41,13 @@ class StructuralCausalAdapter(nn.Module):
     """Structural causal adapter with (i) disentanglement and (ii) structure learning.
 
     Pipeline:
-      1) Disentanglement Phase:
+      Disentanglement Phase:
          - Cross-attention extracts K latent variables Z in R^{B x K x D}.
          - Independence regularization encourages distinct causal mechanisms.
-      2) Causal Discovery Phase:
-         - Learn a global, sparse adjacency A in {0,1}^{KxK} (relaxed via Gumbel-Sigmoid).
-         - Graph refinement updates latents using a causal GNN layer.
+
 
     Forward returns:
-        output_features: (B, K, D)
+        output_features: 
         aux_loss_dict: {"independence_loss": ..., "sparsity_loss": ..., "adjacency": ..., "adjacency_prob": ...}
     """
 
@@ -371,7 +276,8 @@ class StructuralCausalAdapter(nn.Module):
         #return z_refined, aux
         aux: Dict[str, torch.Tensor] = {
              "independence_loss": independence_loss,}
-        return  z,aux
+        # return  z,aux
+        return z
         
         
         

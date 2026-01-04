@@ -1,16 +1,24 @@
+# 开启：python [test_TabICLClassifierUCR.py](http://_vscodecontentref_/16) --use-var-selector --var-num-channels 10
+# 关闭（默认）：不传 --use-var-selector
 import argparse
 import json
 import torch
 import numpy as np
 from pathlib import Path
-from tabicl.sklearn.classifier import TabICLClassifier
+import random
 
 import pandas as pd
 import os
+import sys
 import multiprocessing as mp
-from tabicl.prior.data_reader import DataReader
 import torch.nn.functional as F
 
+# Allow running this file directly by adding the repo's src/ to PYTHONPATH.
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src")))
+
+from tabicl.sklearn.classifier import TabICLClassifier
+from tabicl.prior.data_reader import DataReader  # type: ignore[import-not-found]
+from tabicl.model.mantis_dev.adapters import VarianceBasedSelector  # type: ignore[import-not-found]
 #MANTIS_CHECKPOINT ="/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/checkpoint/CaukerMixed-data100k_200_2e-3_100epochs.pt"
 MANTIS_CHECKPOINT = "/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint/"
 #TABICL_CHECKPOINT = "/data0/fangjuntao2025/tabicl-main/tabICLOrignCheckpoint/tabicl-classifier-v1.1-0506.ckpt"
@@ -24,11 +32,35 @@ WORKER_USE_MANTIS = True
 # Module-level worker helpers for multiprocessing (must be picklable / top-level)
 WORKER_READER = None
 WORKER_CLF = None
+WORKER_USE_VAR_SELECTOR = False
+WORKER_VAR_NUM_CHANNELS = None
 DEFAULT_NORM_METHODS = ["none", "robust"]
 _NORM_SENTINEL = object()
 
 #USE_PARALLEL_EVAL = os.environ.get("TABICL_USE_MULTIGPU", "1") == "1"
 USE_PARALLEL_EVAL = 0
+
+
+def set_global_seed(seed: int, *, deterministic: bool = False) -> None:
+    """Best-effort reproducibility across python/numpy/torch.
+
+    Note: some CUDA ops may still be nondeterministic depending on hardware/ops.
+    """
+    seed = int(seed)
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        try:
+            torch.use_deterministic_algorithms(True)
+        except Exception:
+            pass
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
 
 SKIP_UEA_DATASETS = {
     "AtrialFibrillation",
@@ -68,11 +100,62 @@ def _prepare_feature_array(array: np.ndarray) -> np.ndarray:
     # otherwise flatten all trailing axes into feature dimension
     return array.reshape(array.shape[0], -1)
 
-def _worker_init(uea_path, ucr_path, use_mantis, mantis_batch_size, tabicl_ckpt, mantis_ckpt, transform_ts_size, norm_methods):
+
+def _maybe_var_select_multichannel(
+    X_train: np.ndarray,
+    X_test: np.ndarray,
+    *,
+    enabled: bool,
+    new_num_channels: int | None,
+    dataset_name: str = "",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Optionally apply VarianceBasedSelector on multichannel time-series.
+
+    Expected input shape: (N, C, L). If not 3D or C<=1, returns unchanged.
+    """
+    if (not enabled) or (new_num_channels is None):
+        return X_train, X_test
+
+    X_train_np = np.asarray(X_train)
+    X_test_np = np.asarray(X_test)
+    if X_train_np.ndim != 3:
+        return X_train_np, X_test_np
+
+    _, c_train, _ = X_train_np.shape
+    if c_train <= 1:
+        return X_train_np, X_test_np
+
+    k = int(new_num_channels)
+    k = max(1, min(k, c_train))
+    if k == c_train:
+        return X_train_np, X_test_np
+
+    if dataset_name:
+        print(f"[VarSelector] {dataset_name}: channels {c_train} -> {k}")
+
+    selector = VarianceBasedSelector(k)
+    selector.fit(X_train_np)
+    return selector.transform(X_train_np), selector.transform(X_test_np)
+
+def _worker_init(
+    uea_path,
+    ucr_path,
+    use_mantis,
+    mantis_batch_size,
+    tabicl_ckpt,
+    mantis_ckpt,
+    transform_ts_size,
+    norm_methods,
+    use_var_selector,
+    var_num_channels,
+    seed,
+    deterministic,
+):
     """Initializer run once per worker process to create heavy objects and bind a GPU."""
-    global WORKER_READER, WORKER_CLF, WORKER_USE_MANTIS
+    global WORKER_READER, WORKER_CLF, WORKER_USE_MANTIS, WORKER_USE_VAR_SELECTOR, WORKER_VAR_NUM_CHANNELS
 
     # assign a GPU to this worker based on its rank and CUDA_VISIBLE_DEVICES
+    rank = 0
     try:
         gpu_ids = os.environ.get("CUDA_VISIBLE_DEVICES", "0").split(",")
         # multiprocessing sets _identity to a 1-based worker id
@@ -86,8 +169,17 @@ def _worker_init(uea_path, ucr_path, use_mantis, mantis_batch_size, tabicl_ckpt,
         # if anything goes wrong, just fall back to default device
         pass
 
+    # Reproducibility: make each worker deterministic but not identical.
+    if seed is not None:
+        try:
+            set_global_seed(int(seed) + int(rank), deterministic=bool(deterministic))
+        except Exception:
+            pass
+
     WORKER_READER = DataReader(UEA_data_path=uea_path, UCR_data_path=ucr_path, transform_ts_size=transform_ts_size)
     WORKER_USE_MANTIS = use_mantis
+    WORKER_USE_VAR_SELECTOR = bool(use_var_selector)
+    WORKER_VAR_NUM_CHANNELS = var_num_channels
     clf_kwargs = dict(
         verbose=False,
         n_estimators=32,
@@ -107,10 +199,21 @@ def _select_first_channel(array: np.ndarray) -> np.ndarray:
     return array
 def _worker_eval(dataset_name):
     """Evaluate a single dataset inside a worker process; returns (name, acc, err)."""
-    global WORKER_READER, WORKER_CLF, WORKER_USE_MANTIS
+    global WORKER_READER, WORKER_CLF, WORKER_USE_MANTIS, WORKER_USE_VAR_SELECTOR, WORKER_VAR_NUM_CHANNELS
     try:
         X_train, y_train = WORKER_READER.read_dataset(dataset_name, which_set='train')
         X_test, y_test = WORKER_READER.read_dataset(dataset_name, which_set='test')
+
+        # Optional: variance-based channel selection BEFORE any encoding/flatten.
+        if WORKER_USE_VAR_SELECTOR:
+            X_train, X_test = _maybe_var_select_multichannel(
+                X_train,
+                X_test,
+                enabled=True,
+                new_num_channels=WORKER_VAR_NUM_CHANNELS,
+                dataset_name=dataset_name,
+            )
+
         # 当 worker 未使用 mantis 时，将 3D [N, C, L] 展平为 2D [N, C*L]
         if not WORKER_USE_MANTIS:
             X_train = _prepare_feature_array(X_train)
@@ -151,6 +254,10 @@ def evaluate_datasets_parallel(dataset_names, worker_config, max_workers=MAXWORK
         worker_config['mantis_ckpt'],
         worker_config['transform_ts_size'],
         worker_config['norm_methods'],
+        worker_config.get('use_var_selector', False),
+        worker_config.get('var_num_channels', None),
+        worker_config.get('seed', None),
+        worker_config.get('deterministic', False),
     )
 
     with ctx.Pool(processes=requested, initializer=_worker_init, initargs=initargs) as pool:
@@ -184,7 +291,11 @@ class UCR_UEAEvaluator:
                  mantis_ckpt: str = MANTIS_CHECKPOINT,
                  results_dir: str = DEFAULT_RESULTS_DIR,
                  max_workers: int = MAXWORKERS,
-                 norm_methods=_NORM_SENTINEL):
+                 norm_methods=_NORM_SENTINEL,
+                 use_var_selector: bool = False,
+                 var_num_channels: int | None = None,
+                 seed: int | None = None,
+                 deterministic: bool = False):
         """
         初始化评估器。
 
@@ -212,6 +323,8 @@ class UCR_UEAEvaluator:
         self.stats = []
         self.use_mantis = use_mantis
         self.mantis_batch_size = mantis_batch_size
+        self.use_var_selector = bool(use_var_selector)
+        self.var_num_channels = var_num_channels
         self.tabicl_ckpt = tabicl_ckpt
         self.mantis_ckpt = mantis_ckpt
         self.results_dir = Path(results_dir)
@@ -221,6 +334,13 @@ class UCR_UEAEvaluator:
             self.norm_methods = DEFAULT_NORM_METHODS.copy()
         else:
             self.norm_methods = norm_methods
+
+        self.seed = seed
+        self.deterministic = bool(deterministic)
+        # Ensure reproducibility even when this class is used programmatically
+        # (not only via the CLI __main__ path).
+        if self.seed is not None:
+            set_global_seed(int(self.seed), deterministic=self.deterministic)
 
         # Instantiate classifier once to avoid re-loading the heavy checkpoint repeatedly.
         classifier_kwargs = dict(
@@ -250,6 +370,10 @@ class UCR_UEAEvaluator:
             mantis_ckpt=self.mantis_ckpt,
             transform_ts_size=512,
             norm_methods=self.norm_methods,
+            use_var_selector=self.use_var_selector,
+            var_num_channels=self.var_num_channels,
+            seed=self.seed,
+            deterministic=self.deterministic,
         )
 
     def evaluate_dataset(self, dataset_name: str) -> float:
@@ -270,6 +394,16 @@ class UCR_UEAEvaluator:
             # 加载数据
             X_train, y_train = self.reader.read_dataset(dataset_name, which_set='train')   
             X_test, y_test = self.reader.read_dataset(dataset_name, which_set='test')
+
+            # Optional: variance-based channel selection BEFORE any encoding/flatten.
+            if self.use_var_selector:
+                X_train, X_test = _maybe_var_select_multichannel(
+                    X_train,
+                    X_test,
+                    enabled=True,
+                    new_num_channels=self.var_num_channels,
+                    dataset_name=dataset_name,
+                )
 
             # 如果未使用 mantis，则将 3D [N, C, L] 展平为 2D [N, C*L]
             if not self.use_mantis:
@@ -369,6 +503,10 @@ class UCR_UEAEvaluator:
             self._worker_config['mantis_ckpt'],
             self._worker_config['transform_ts_size'],
             self._worker_config['norm_methods'],
+            self._worker_config.get('use_var_selector', False),
+            self._worker_config.get('var_num_channels', None),
+            self._worker_config.get('seed', None),
+            self._worker_config.get('deterministic', False),
         )) as pool:
             # Evaluate UCR
             # ucr_list = sorted(self.reader.dataset_list_ucr)
@@ -599,12 +737,38 @@ def _parse_args():
         action="store_false",
         help="Fallback to TabICL's built-in normalization pipeline (includes power transform).",
     )
+    parser.add_argument(
+        "--use-var-selector",
+        dest="use_var_selector",
+        action="store_true",
+        help="Apply VarianceBasedSelector on multichannel time-series before Mantis encoding.",
+    )
+    parser.add_argument(
+        "--var-num-channels",
+        type=int,
+        default=None,
+        help="Number of channels kept by VarianceBasedSelector (only used with --use-var-selector).",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=3407,
+        help="Global random seed for reproducibility (python/numpy/torch).",
+    )
+    parser.add_argument(
+        "--deterministic",
+        action="store_true",
+        help="Best-effort deterministic mode for torch/CUDA (may reduce performance).",
+    )
     parser.set_defaults(use_mantis=WORKER_USE_MANTIS, robust_norm=True)
     return parser.parse_args()
 
 
 if __name__ == "__main__":
     args = _parse_args()
+    if args.seed is not None:
+        set_global_seed(args.seed, deterministic=bool(args.deterministic))
+
     batch_size = max(1, args.batch_size)
     max_workers = max(1, args.max_workers)
     norm_methods = DEFAULT_NORM_METHODS.copy() if args.robust_norm else None
@@ -620,6 +784,10 @@ if __name__ == "__main__":
         results_dir=args.results_dir,
         max_workers=max_workers,
         norm_methods=norm_methods,
+        use_var_selector=getattr(args, "use_var_selector", False),
+        var_num_channels=getattr(args, "var_num_channels", None),
+        seed=getattr(args, "seed", None),
+        deterministic=bool(getattr(args, "deterministic", False)),
     )
     # target_datasets = [
     #     "BasicMotions",

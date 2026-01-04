@@ -1,6 +1,7 @@
 #关闭推理时 D 维置乱：python [train_adapter_with_classifierOrign.py](http://_vscodecontentref_/13) --infer_no_feat_shuffle
 # 训练/预训练阶段关闭 D 维置乱：加 --train_no_feat_perm
 # 推理阶段关闭 D 维置乱（TabICLClassifier 侧）：仍用你已有的 --infer_no_feat_shuffle
+#--debug_stats：每个 train_step 打印统计
 import argparse
 import os
 import sys
@@ -8,6 +9,7 @@ import json
 import torch
 import numpy as np
 import random
+from datetime import datetime
 from torch import nn, optim
 from torch.utils.data import DataLoader, TensorDataset
 from pathlib import Path
@@ -18,12 +20,12 @@ import copy
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../../"))
 
 from tabicl.model.mantis_tabicl import MantisTabICL, build_mantis_encoder
-from tabicl.model.adapterOrign import CALDA_Adapter, DistributionDiversityLoss,ChannelMLPConcatAdapter, SafeResidualAdapter
+from tabicl.model.adapterOrign import CALDA_Adapter, CALDA_AdapterV2, DistributionDiversityLoss,ChannelMLPConcatAdapter, SafeResidualAdapter,LoRAResidualAdapter,CausalChannelAdapter
 from tabicl.prior.data_reader import DataReader
 from tabicl.model.tabicl import TabICL
 from tabicl.sklearn.classifier import TabICLClassifier
 from tabicl.model.mantis_dev.adapters import VarianceBasedSelector
-
+from tabicl.model.adapter import StructuralCausalAdapter
 def load_dataset_names_from_file(filepath):
     """从结果文件读取所有数据集名称（每行格式：name: acc）"""
     names = []
@@ -63,6 +65,29 @@ def resize_series(X, target_len=512):
     # F.interpolate expects (N, C, L)
     X_resized = torch.nn.functional.interpolate(X_tensor, size=target_len, mode='linear', align_corners=False)
     return X_resized
+
+
+def _flatten_multichannel_as_single_channel(
+    X: torch.Tensor, y: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Flatten a multichannel dataset into single-channel samples for pretraining.
+
+    Example:
+      X: (N, C, L) -> (N*C, 1, L)
+      y: (N,)     -> (N*C,)  (repeat each label C times)
+
+    If C<=1, returns inputs unchanged.
+    """
+    if not isinstance(X, torch.Tensor) or not isinstance(y, torch.Tensor):
+        return X, y
+    if X.dim() != 3:
+        return X, y
+    N, C, L = X.shape
+    if C <= 1:
+        return X, y
+    X_flat = X.contiguous().view(N * C, 1, L)
+    y_flat = y.contiguous().view(N).repeat_interleave(C)
+    return X_flat, y_flat
 
 
 def _maybe_select_channels_uea(
@@ -407,6 +432,34 @@ def load_dataset_data(reader, dataset_name, *, is_uea: bool, use_var_selector: b
     return X_train, y_train, X_test, y_test
 
 
+def _adapter_run_tag(adapter: nn.Module | None, args) -> str:
+    """Create a run tag for checkpoint naming.
+
+    Format: <AdapterClassName>_<YYYYmmdd_HHMMSS>
+    """
+    if adapter is None:
+        adapter_name = "NoAdapter" if getattr(args, "no_adapter", False) else "AdapterNone"
+    else:
+        adapter_name = adapter.__class__.__name__
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return f"{adapter_name}_{ts}"
+
+
+def _find_latest_ckpt(ckpt_dir: str, patterns: list[str]) -> str | None:
+    """Find newest checkpoint in ckpt_dir matching any glob pattern."""
+    p = Path(ckpt_dir)
+    if not p.is_dir():
+        return None
+    candidates: list[Path] = []
+    for pat in patterns:
+        candidates.extend(p.glob(pat))
+    candidates = [c for c in candidates if c.is_file()]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+    return str(candidates[0])
+
+
 def _sample_support_indices_stratified(y_train: torch.Tensor, n_support: int) -> torch.Tensor:
     """Sample support indices from training labels.
 
@@ -453,19 +506,11 @@ def _sample_support_indices_stratified(y_train: torch.Tensor, n_support: int) ->
     return chosen_idx
 
 
-def _build_meta_tasks(model, batch_datasets, device, args):
+def _prepare_meta_tasks(model, batch_datasets, device, args):
     """
-    Build augmented meta-learning tasks for adapter training/eval.
-
-    Returns:
-        X_aug_batch: (T, L, D)
-        y_sup_aug_batch: (T, n_support)
-        y_qry_aug_batch: (T, qry_len)
-        valid_mask_batch: (T, qry_len)
-        n_support: int
-        qry_len: int
+    Prepare meta-learning tasks and run adapter to get embeddings.
+    Does NOT perform augmentation.
     """
-    # 1) Determine n_support (context size) for this batch
     min_train_len = min(d[0].size(0) for d in batch_datasets)
     n_support = min(args.train_size, min_train_len)
     if n_support < 1:
@@ -477,24 +522,59 @@ def _build_meta_tasks(model, batch_datasets, device, args):
     valid_mask_list = []
 
     for X_train, y_train, X_test, y_test in batch_datasets:
-        # Random (preferably stratified) episodic support selection
-        support_idx = _sample_support_indices_stratified(y_train, n_support)
-        support_mask = torch.ones(y_train.size(0), dtype=torch.bool)
-        support_mask[support_idx] = False
-        query_train_idx = torch.nonzero(support_mask, as_tuple=False).flatten()
+        tabicl_max = int(getattr(model.tabicl_model, "max_classes", 10))
+
+        classes_all = torch.unique(y_train)
+        if classes_all.numel() == 0:
+            continue
+
+        k = int(min(tabicl_max, int(classes_all.numel()), int(n_support)))
+        if k < 1:
+            continue
+
+        if classes_all.numel() > k:
+            perm = torch.randperm(classes_all.numel())
+            classes_keep = classes_all[perm[:k]]
+        else:
+            classes_keep = classes_all
+
+        keep_mask_train = torch.isin(y_train, classes_keep)
+        train_keep_idx = torch.nonzero(keep_mask_train, as_tuple=False).flatten()
+
+        # --- FIX 1: 强制每个 task 的 support 长度必须等于 n_support，否则跳过 ---
+        if int(train_keep_idx.numel()) < int(n_support):
+            continue
+
+        y_train_keep = y_train[train_keep_idx]
+        support_local = _sample_support_indices_stratified(
+            y_train_keep,
+            n_support=int(n_support),   # 固定长度
+        )
+        support_idx = train_keep_idx[support_local]
 
         X_sup = X_train[support_idx]
         y_sup = y_train[support_idx]
 
-        X_qry = torch.cat([X_train[query_train_idx], X_test], dim=0)
-        y_qry = torch.cat([y_train[query_train_idx], y_test], dim=0)
+        support_classes = torch.unique(y_sup)
+        keep_mask_train_sup = torch.isin(y_train, support_classes)
+        keep_mask_test_sup = torch.isin(y_test, support_classes)
+
+        support_mask = torch.ones(y_train.size(0), dtype=torch.bool)
+        support_mask[support_idx] = False
+        query_train_idx = torch.nonzero(support_mask & keep_mask_train_sup, as_tuple=False).flatten()
+        query_test_idx = torch.nonzero(keep_mask_test_sup, as_tuple=False).flatten()
+
+        X_qry = torch.cat([X_train[query_train_idx], X_test[query_test_idx]], dim=0)
+        y_qry = torch.cat([y_train[query_train_idx], y_test[query_test_idx]], dim=0)
+
+        if X_qry.size(0) < 1:
+            continue
 
         X_seq = torch.cat([X_sup, X_qry], dim=0)
         X_seq_list.append(X_seq)
 
-        # Map classes based on support-set classes
         unique_classes, inverse_indices = torch.unique(y_sup, return_inverse=True)
-        y_sup_mapped = inverse_indices.to(device)
+        y_sup_mapped = inverse_indices.to(device)  # (n_support,) 现在保证长度一致
 
         max_label = max(y_sup.max(), y_qry.max()).item()
         mapper = torch.full((max_label + 1,), -1, dtype=torch.long, device=device)
@@ -503,7 +583,6 @@ def _build_meta_tasks(model, batch_datasets, device, args):
         y_qry_mapped = mapper[y_qry.to(device)]
         valid_mask = (y_qry_mapped != -1)
 
-        # Safe mapping for augmentation (replace -1 with 0)
         y_qry_mapped_safe = y_qry_mapped.clone()
         y_qry_mapped_safe[~valid_mask] = 0
 
@@ -511,7 +590,10 @@ def _build_meta_tasks(model, batch_datasets, device, args):
         y_qry_mapped_list.append(y_qry_mapped_safe)
         valid_mask_list.append(valid_mask)
 
-    # 2) Collate: truncate to min length in batch and args.max_icl_len
+    # --- FIX 2: 可能全部被 continue 掉，避免 min() 空列表崩溃 ---
+    if not X_seq_list:
+        return None
+
     min_len = min(x.size(0) for x in X_seq_list)
     target_len = min(min_len, args.max_icl_len)
     if target_len <= n_support:
@@ -522,7 +604,8 @@ def _build_meta_tasks(model, batch_datasets, device, args):
     y_qry_batch_list = []
     mask_batch_list = []
 
-    for i in range(len(batch_datasets)):
+    # --- FIX 3: 用 X_seq_list 的长度来 collate，避免和 batch_datasets 长度不一致导致错位 ---
+    for i in range(len(X_seq_list)):
         x_item = X_seq_list[i][:target_len]
         emb = model.get_adapter_output(x_item.unsqueeze(0))  # (1, L, D)
         adapter_out_list.append(emb.squeeze(0))
@@ -534,14 +617,20 @@ def _build_meta_tasks(model, batch_datasets, device, args):
         mask_batch_list.append(valid_mask_list[i][:qry_len])
 
     adapter_out = torch.stack(adapter_out_list)  # (B, L, D)
+    return adapter_out, y_sup_batch_list, y_qry_batch_list, mask_batch_list, n_support
 
+
+def _augment_meta_tasks(adapter_out, y_sup_batch_list, y_qry_batch_list, mask_batch_list, n_support, device, args):
+    """
+    Augment embeddings to create meta-tasks.
+    """
     # 3) Augment
     aug_emb_list = []
     aug_y_sup_list = []
     aug_y_qry_list = []
     aug_mask_list = []
 
-    for i in range(len(batch_datasets)):
+    for i in range(adapter_out.size(0)):
         emb = adapter_out[i].unsqueeze(0)  # (1, L, D)
         y_sup = y_sup_batch_list[i].unsqueeze(0)  # (1, n_support)
         y_qry = y_qry_batch_list[i].unsqueeze(0)  # (1, qry_len)
@@ -579,6 +668,41 @@ def _build_meta_tasks(model, batch_datasets, device, args):
     return X_aug_batch, y_sup_aug_batch, y_qry_aug_batch, valid_mask_batch, n_support, qry_len
 
 
+def _build_meta_tasks(model, batch_datasets, device, args):
+    """
+    Legacy wrapper for compatibility.
+    """
+    prepared = _prepare_meta_tasks(model, batch_datasets, device, args)
+    if prepared is None:
+        return None
+    adapter_out, y_sup_batch_list, y_qry_batch_list, mask_batch_list, n_support = prepared
+    return _augment_meta_tasks(adapter_out, y_sup_batch_list, y_qry_batch_list, mask_batch_list, n_support, device, args)
+
+
+
+def _tabicl_train_forward(
+    tabicl_model,
+    X: torch.Tensor,
+    y_train: torch.Tensor,
+    d: torch.Tensor | None = None,
+    *,
+    embed_with_test: bool = False,
+) -> torch.Tensor:
+    """Run TabICL training forward without toggling model.train()."""
+    B, T, H = X.shape
+    train_size = y_train.shape[1]
+    assert train_size <= T, "Number of training samples exceeds total samples"
+
+    if d is not None and len(d.unique()) == 1 and d[0] == H:
+        d = None
+
+    embeddings = tabicl_model.col_embedder._train_forward(
+        X, d, None if embed_with_test else train_size
+    )
+    representations = tabicl_model.row_interactor._train_forward(embeddings, d)
+    return tabicl_model.icl_predictor._icl_predictions(representations, y_train)
+
+
 def _compute_meta_loss(model, criterion, X_aug_batch, y_sup_aug_batch, y_qry_aug_batch, valid_mask_batch):
     """Compute averaged meta loss across tasks in X_aug_batch."""
     total_loss = 0.0
@@ -593,7 +717,9 @@ def _compute_meta_loss(model, criterion, X_aug_batch, y_sup_aug_batch, y_qry_aug
         if not mask_in.any():
             continue
 
-        logits = model.tabicl_model(X_in, y_sup_in, return_logits=True)
+        logits = _tabicl_train_forward(
+            model.tabicl_model, X_in, y_sup_in, d=None, embed_with_test=False
+        )
 
         qry_len = y_qry_in.size(1)
         if logits.size(1) == X_in.size(1):
@@ -618,50 +744,162 @@ def train_step(model, optimizer, criterion, batch_datasets, device, args):
     model.train()
     optimizer.zero_grad()
 
-    built = _build_meta_tasks(model, batch_datasets, device, args)
-    if built is None:
+    # 1. Prepare data and run Adapter (get embeddings)
+    prepared = _prepare_meta_tasks(model, batch_datasets, device, args)
+    if prepared is None:
         return 0.0
-    X_aug_batch, y_sup_aug_batch, y_qry_aug_batch, valid_mask_batch, _, _ = built
-
-    # Forward/backward across tasks (manual to keep per-task class counts independent)
+    adapter_out, y_sup_batch_list, y_qry_batch_list, mask_batch_list, n_support = prepared
+    
+    # adapter_out: (B, L, D) - connected to Adapter graph
+    
     total_loss = 0.0
     denom = 0
 
-    for i in range(X_aug_batch.size(0)):
-        X_in = X_aug_batch[i].unsqueeze(0)
-        y_sup_in = y_sup_aug_batch[i].unsqueeze(0)
-        y_qry_in = y_qry_aug_batch[i].unsqueeze(0)
-        mask_in = valid_mask_batch[i]
+    # Debug/observability stats (per train_step)
+    skipped_mask_empty = 0
+    skipped_oob = 0
+    skipped_other = 0
+    valid_ratio_sum = 0.0
+    
+    # Scale factor for loss averaging
+    # scale_factor = 1.0 / (adapter_out.size(0) * args.n_augmentations)
 
-        if not mask_in.any():
+    # Initialize gradient tensor for adapter output
+    grad_adapter_out = torch.zeros_like(adapter_out)
+
+    # 2. Loop over datasets (tasks)
+    for i in range(adapter_out.size(0)):
+        # Get embedding for this dataset
+        emb = adapter_out[i] # (L, D)
+        
+        # Detach to create a leaf for gradient accumulation
+        emb_leaf = emb.detach().requires_grad_(True)
+        
+        y_sup = y_sup_batch_list[i]
+        y_qry = y_qry_batch_list[i]
+        mask = mask_batch_list[i]
+        
+        n_classes = y_sup.max().item() + 1
+        tabicl_max = int(getattr(model.tabicl_model, "max_classes", 10))
+        if n_classes < 2:
+            skipped_other += int(args.n_augmentations)
             continue
+        if n_classes > tabicl_max:
+            # Should not happen if _prepare_meta_tasks is correct, but keep it safe
+            skipped_other += int(args.n_augmentations)
+            continue
+        grad_sum = torch.zeros_like(emb_leaf)
+        used_views = 0
 
-        logits = model.tabicl_model(X_in, y_sup_in, return_logits=True)
+        for _ in range(int(args.n_augmentations)):
+            # One independent augmented view (new graph each iteration)
+            X_aug, y_sup_aug, y_qry_aug, _perm, _shift, _norm_applied = augment_batch(
+                emb_leaf.unsqueeze(0),          # (1, L, D)
+                y_sup.unsqueeze(0),             # (1, n_support)
+                y_qry.unsqueeze(0),             # (1, qry_len)
+                device,
+                n_classes,
+                enable_feat_perm=(not args.train_no_feat_perm),
+            )
 
-        qry_len = y_qry_in.size(1)
-        if logits.size(1) == X_in.size(1):
-            logits_qry = logits[:, -qry_len:, :]
-        else:
-            logits_qry = logits
+            X_in = X_aug                          # (1, L, D)
+            y_sup_in = y_sup_aug                  # (1, n_support)
+            y_qry_in = y_qry_aug                  # (1, qry_len)
+            mask_in = mask                        # (qry_len,)
 
-        logits_flat = logits_qry.reshape(-1, logits_qry.size(-1))
-        y_flat = y_qry_in.reshape(-1)
-        mask_flat = mask_in.reshape(-1)
+            if not mask_in.any():
+                skipped_mask_empty += 1
+                continue
 
-        loss = criterion(logits_flat[mask_flat], y_flat[mask_flat])+1e-4 * (model.adapter.alpha ** 2)
-        loss = loss / X_aug_batch.size(0)
+            if getattr(args, "debug_oob", False):
+                print(f"[Pre-Forward] Task {i}: n_classes={n_classes}, y_sup_in max={y_sup_in.max()}")
+                torch.cuda.synchronize()
 
-        # Ensure graph exists even if something odd happens
-        if not loss.requires_grad:
-            dummy = sum(p.sum() for p in model.adapter.parameters()) * 0.0
-            loss = loss + dummy
+            logits = _tabicl_train_forward(
+                model.tabicl_model, X_in, y_sup_in, d=None, embed_with_test=False
+            )
 
-        loss.backward()
-        total_loss += loss.item()
-        denom += 1
+            if getattr(args, "debug_oob", False):
+                torch.cuda.synchronize()
+
+            if args.debug_grad:
+                print(
+                    "X_in_requires_grad",
+                    X_in.requires_grad,
+                    "logits_requires_grad",
+                    logits.requires_grad,
+                    "grad_fn",
+                    logits.grad_fn,
+                )
+
+            if not logits.requires_grad:
+                raise RuntimeError(
+                    "TabICL logits has no grad: check _tabicl_train_forward path / no_grad / detach."
+                )
+
+            qry_len = y_qry_in.size(1)
+            logits_qry = logits[:, -qry_len:, :] if logits.size(1) == X_in.size(1) else logits
+
+            logits_flat = logits_qry.reshape(-1, logits_qry.size(-1))
+            y_flat = y_qry_in.reshape(-1)
+            mask_flat = mask_in.reshape(-1)
+
+            if not mask_flat.any():
+                skipped_mask_empty += 1
+                continue
+
+            y_sel = y_flat[mask_flat]
+            C = logits_flat.size(-1)
+            y_min = y_sel.min().item()
+            y_max = y_sel.max().item()
+
+            if y_min < 0 or y_max >= C:
+                if getattr(args, "debug_oob", False):
+                    print(f"[OOB] Task {i}: y_min={y_min}, y_max={y_max}, C={C}, n_classes={n_classes}")
+                    print(f"      uniq(y_sup_in)={torch.unique(y_sup_in).tolist()}")
+                    print(f"      uniq(y_sel)={torch.unique(y_sel)[:20].tolist()}")
+                skipped_oob += 1
+                continue
+
+            loss = criterion(logits_flat[mask_flat], y_sel)
+
+            # Observability: how many query positions are valid (mask ratio)
+            valid_ratio_sum += float(mask_flat.float().mean().item())
+
+            # Take gradient wrt emb_leaf only (do not backward through adapter graph here)
+            g = torch.autograd.grad(loss, emb_leaf, retain_graph=False, allow_unused=False)[0]
+            grad_sum += g.detach()
+
+            total_loss += float(loss.item())
+            denom += 1
+            used_views += 1
+
+        if used_views > 0:
+            grad_adapter_out[i] = grad_sum / float(used_views)
+    # Backward pass for adapter
+    adapter_out.backward(grad_adapter_out)
 
     optimizer.step()
-    return total_loss if denom > 0 else 0.0
+
+    if denom == 0:
+        if getattr(args, "debug_stats", False):
+            print(
+                f"[train_step][warn] denom=0 | skipped_mask_empty={skipped_mask_empty} "
+                f"skipped_oob={skipped_oob} skipped_other={skipped_other}"
+            )
+        return 0.0
+
+    avg_loss = total_loss / float(denom)
+    mean_valid_ratio = valid_ratio_sum / float(denom)
+
+    if getattr(args, "debug_stats", False):
+        print(
+            f"[train_step] avg_loss={avg_loss:.6f} denom={denom} "
+            f"skipped_mask_empty={skipped_mask_empty} skipped_oob={skipped_oob} "
+            f"skipped_other={skipped_other} mean_valid_ratio={mean_valid_ratio:.4f}"
+        )
+
+    return avg_loss
 
 
 @torch.no_grad()
@@ -675,6 +913,16 @@ def validate_step(model, criterion, batch_datasets, device, args):
 
 def main():
     parser = argparse.ArgumentParser()
+
+    def _add_bool_optional(parser: argparse.ArgumentParser, name: str, *, default: bool, help_text: str):
+        """Add a boolean flag that supports both --<name> and --no-<name> when available."""
+        action_cls = getattr(argparse, "BooleanOptionalAction", None)
+        if action_cls is not None:
+            parser.add_argument(f"--{name}", action=action_cls, default=default, help=help_text)
+        else:
+            parser.add_argument(f"--{name}", dest=name, action="store_true", help=help_text)
+            parser.add_argument(f"--no-{name}", dest=name, action="store_false", help=f"Disable: {help_text}")
+            parser.set_defaults(**{name: default})
     parser.add_argument("--tabicl_ckpt", type=str, default="/data0/fangjuntao2025/tabicl-main/tabICLOrignCheckpoint/tabicl-classifier-v1.1-0506.ckpt")
     parser.add_argument("--mantis_ckpt", type=str, default="/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint/")
     parser.add_argument("--uea_path", type=str, default="/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UEAData/")
@@ -685,9 +933,9 @@ def main():
     parser.add_argument("--max_icl_len", type=int, default=512, help="Max sequence length for ICL training to avoid OOM")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--no_adapter", action="store_true", help="Disable adapter and use raw Mantis embeddings")
-    parser.add_argument("--mantis_batch_size", type=int, default=16, help="Batch size for Mantis encoder")
+    parser.add_argument("--mantis_batch_size", type=int, default=128, help="Batch size for Mantis encoder")
     parser.add_argument("--meta_batch_size", type=int, default=8, help="Number of datasets per training step")
-    parser.add_argument("--train_size", type=int, default=100, help="Number of support samples (context size)")
+    parser.add_argument("--train_size", type=int, default=256, help="Number of support samples (context size)")
     parser.add_argument("--output_file", type=str, default=None, help="Path to save results JSON")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--n_augmentations", type=int, default=5, help="Number of augmentations per dataset")
@@ -695,6 +943,41 @@ def main():
     parser.add_argument("--ckpt_dir", type=str, default="/data0/fangjuntao2025/tabicl-main/checkpoints/mantis_adapter_pretrainNew", help="Directory to save adapter checkpoints")
     parser.add_argument("--ckpt_prefix", type=str, default="adapter", help="Checkpoint filename prefix")
     parser.add_argument("--save_last", action="store_true", help="Also save last checkpoint each epoch")
+
+    _add_bool_optional(
+        parser,
+        "use_uea_pretrain",
+        default=True,
+        help_text="Whether to include UEA benchmark datasets during adapter pretraining/validation.",
+    )
+    _add_bool_optional(
+        parser,
+        "use_uea_eval",
+        default=True,
+        help_text="Whether to include UEA benchmark datasets during evaluation/inference.",
+    )
+
+    parser.add_argument(
+        "--pretrain_flatten_channels",
+        action="store_true",
+        help=(
+            "During adapter pretraining/validation only: treat each channel as an independent single-channel sample. "
+            "Transforms (N,C,L)->(N*C,1,L) and repeats labels. Evaluation keeps original multichannel data."
+        ),
+    )
+
+    # Adapter type selection
+    parser.add_argument(
+        "--adapter_type",
+        type=str,
+        default="calda",
+        choices=["none", "calda", "calda_v2", "channel_mlp_concat", "safe_residual", "sca","lora_residual","cca"],
+        help=(
+            "Which adapter to use when not --no_adapter. "
+            "none: disable adapter; calda: CALDA_Adapter; calda_v2: per-channel CALDA with concat then projection; "
+            "channel_mlp_concat: per-channel MLP + concat then projection; safe_residual: residual adapter; sca: StructuralCausalAdapter."
+        ),
+    )
 
     # v2: how to fuse multichannel Mantis representations before TabICL
     parser.add_argument(
@@ -738,6 +1021,18 @@ def main():
         action="store_true",
         help="During adapter pretraining/meta-task augmentation, disable feature-dimension permutation (D-dim randperm). Keep norm + class shift.",
     )
+    parser.add_argument(
+        "--debug_grad",
+        action="store_true",
+        help="Print requires_grad flags and grad_fn for TabICL logits during training.",
+    )
+    parser.add_argument(
+        "--debug_stats",
+        action="store_true",
+        help="Print per-train_step stats: denom / skipped views / mean_valid_ratio / avg_loss.",
+    )
+    parser.add_argument("--debug_oob", action="store_true",
+                        help="Print details when CrossEntropy targets are out-of-bounds (prevents CUDA assert).")
     
     args = parser.parse_args()
     
@@ -771,11 +1066,79 @@ def main():
             print("[Info] mantis_fusion='sum' (v2) -> forcing --no_adapter (no learnable adapter).")
         args.no_adapter = True
 
-    if args.no_adapter:
-        adapter = None
-    else:
-        #adapter = CALDA_Adapter(mantis_emb_dim=mantis_dim, tabicl_input_dim=tabicl_dim).to(device)
-        adapter = SafeResidualAdapter(dim=mantis_dim, hidden=256, dropout=0.0, fuse="mean").to(device)
+    # Adapter builder (keeps overall training framework unchanged)
+    def _build_adapter_from_args() -> nn.Module | None:
+        if args.no_adapter or args.adapter_type == "none":
+            return None
+
+        if args.adapter_type == "calda":
+            return CALDA_Adapter(mantis_emb_dim=mantis_dim, tabicl_input_dim=tabicl_dim).to(device)
+
+        if args.adapter_type == "calda_v2":
+            # CALDA v2 internally concatenates per-channel outputs, then projects back to tabicl_dim
+            # to keep TabICL input dimension compatible with the checkpoint.
+            return CALDA_AdapterV2(
+                mantis_emb_dim=mantis_dim,
+                tabicl_input_dim=tabicl_dim,
+                # out_dim=tabicl_dim,
+            ).to(device)
+
+        if args.adapter_type == "channel_mlp_concat":
+            return ChannelMLPConcatAdapter(
+                in_dim=mantis_dim,
+                hidden_dim=mantis_dim,
+                out_per_channel=64,
+                dropout=0.0,
+                out_dim=tabicl_dim,
+                use_layernorm=True,
+            ).to(device)
+
+        if args.adapter_type == "safe_residual":
+            return SafeResidualAdapter(
+                dim=mantis_dim,
+                hidden=256,
+                dropout=0.0,
+                fuse="concat",
+                out_dim=tabicl_dim,
+            ).to(device)
+
+        if args.adapter_type == "sca":
+            return StructuralCausalAdapter(emb_dim=mantis_dim).to(device)
+        if args.adapter_type == "lora_residual":   
+            return LoRAResidualAdapter(dim=mantis_dim, rank=8, dropout=0.0, fuse="mean").to(device)
+        if args.adapter_type == "cca":   
+            return CausalChannelAdapter(mantis_emb_dim=mantis_dim, tabicl_input_dim=256,num_latents=4).to(device)
+        raise ValueError(f"Unknown adapter_type={args.adapter_type}")
+
+    if args.mantis_fusion == "sum":
+        # v2: sum-fusion is a non-parametric channel mixer; disable adapter training to match spec
+        if not args.no_adapter:
+            print("[Info] mantis_fusion='sum' (v2) -> forcing --no_adapter (no learnable adapter).")
+        args.no_adapter = True
+        args.adapter_type = "none"
+
+    adapter = _build_adapter_from_args()
+    # Checkpoint naming: adapter class name + timestamp
+    run_tag = _adapter_run_tag(adapter, args)
+    ckpt_base = f"{args.ckpt_prefix}_{run_tag}" if args.ckpt_prefix else run_tag
+
+    # Record run arguments for reproducibility
+    args_log_path = None
+    args_payload = None
+    try:
+        os.makedirs(args.ckpt_dir, exist_ok=True)
+        args_log_path = os.path.join(args.ckpt_dir, f"{ckpt_base}_args.json")
+        args_payload = {
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "argv": sys.argv,
+            "args": vars(args),
+            "run_tag": run_tag,
+        }
+        with open(args_log_path, "w") as f:
+            json.dump(args_payload, f, indent=2, ensure_ascii=False)
+        print(f"[Run] Saved args log: {args_log_path}")
+    except Exception as e:
+        print(f"[Run][warn] Failed to save args log: {e}")
 
     model = MantisAdapterTabICL(
         mantis_model,
@@ -787,8 +1150,15 @@ def main():
     
     reader = DataReader(UEA_data_path=args.uea_path, UCR_data_path=args.ucr_path)
     
-    # Combine UCR and UEA datasets
-    datasets = sorted(reader.dataset_list_ucr)
+    # Dataset selection for pretraining
+    if args.use_uea_pretrain:
+        datasets = sorted(reader.dataset_list_ucr + reader.dataset_list_uea)
+    else:
+        datasets = sorted(reader.dataset_list_ucr)
+    print(
+        f"[Data] Pretrain datasets: UCR={len(reader.dataset_list_ucr)} "
+        f"UEA={'on' if args.use_uea_pretrain else 'off'} (total={len(datasets)})"
+    )
 
     # Split datasets into train/val for meta-pretraining
     train_datasets = datasets
@@ -805,12 +1175,12 @@ def main():
     #--- Pretraining Phase ---
     if not args.no_adapter:
         print(f"Starting Pretraining on {len(train_datasets)} datasets for {args.epochs} epochs...")
-        #optimizer = optim.AdamW(model.adapter.parameters(), lr=args.lr, weight_decay=1e-4)
-        optimizer = torch.optim.AdamW([
-            {"params": model.adapter.fc1.parameters(), "lr": 1e-4, "weight_decay": 0.0},
-            {"params": model.adapter.fc2.parameters(), "lr": 1e-4, "weight_decay": 0.0},
-            {"params": [model.adapter.alpha],         "lr": 1e-5, "weight_decay": 0.0},
-        ])
+        optimizer = optim.AdamW(model.adapter.parameters(), lr=args.lr, weight_decay=1e-4)
+        # optimizer = torch.optim.AdamW([
+        #     {"params": model.adapter.fc1.parameters(), "lr": 1e-4, "weight_decay": 0.0},
+        #     {"params": model.adapter.fc2.parameters(), "lr": 1e-4, "weight_decay": 0.0},
+        #    # {"params": [model.adapter.alpha],         "lr": 1e-5, "weight_decay": 0.0},
+        # ])
         criterion = nn.CrossEntropyLoss()
 
         os.makedirs(args.ckpt_dir, exist_ok=True)
@@ -840,6 +1210,9 @@ def main():
                         var_num_channels=args.var_num_channels,
                     )
                     if X_tr is not None:
+                        if args.pretrain_flatten_channels:
+                            X_tr, y_tr = _flatten_multichannel_as_single_channel(X_tr, y_tr)
+                            X_te, y_te = _flatten_multichannel_as_single_channel(X_te, y_te)
                         batch_data.append((X_tr, y_tr, X_te, y_te))
                 
                 if not batch_data:
@@ -879,6 +1252,9 @@ def main():
                             var_num_channels=args.var_num_channels,
                         )
                         if X_tr is not None:
+                            if args.pretrain_flatten_channels:
+                                X_tr, y_tr = _flatten_multichannel_as_single_channel(X_tr, y_tr)
+                                X_te, y_te = _flatten_multichannel_as_single_channel(X_te, y_te)
                             batch_data.append((X_tr, y_tr, X_te, y_te))
                     if not batch_data:
                         continue
@@ -905,19 +1281,20 @@ def main():
                 "best_val_loss": best_val,
                 "best_epoch": best_epoch,
                 "config": vars(args),
+                "run_tag": run_tag,
                 "tabicl_ckpt": args.tabicl_ckpt,
                 "mantis_ckpt": args.mantis_ckpt,
                 "seed": args.seed,
             }
 
             if args.save_last:
-                last_path = os.path.join(args.ckpt_dir, f"{args.ckpt_prefix}_last.pt")
+                last_path = os.path.join(args.ckpt_dir, f"{ckpt_base}_last.pt")
                 torch.save(ckpt_common, last_path)
 
             if avg_val_loss is not None and avg_val_loss < best_val:
                 best_val = avg_val_loss
                 best_epoch = epoch
-                best_path = os.path.join(args.ckpt_dir, f"{args.ckpt_prefix}_best.pt")
+                best_path = os.path.join(args.ckpt_dir, f"{ckpt_base}_best.pt")
                 ckpt_best = dict(ckpt_common)
                 ckpt_best["best_val_loss"] = best_val
                 ckpt_best["best_epoch"] = best_epoch
@@ -925,7 +1302,7 @@ def main():
                 print(f"Saved best checkpoint: {best_path} (val_loss={best_val:.6f})")
             elif not val_datasets:
                 # If no validation, save best by train loss
-                train_path = os.path.join(args.ckpt_dir, f"{args.ckpt_prefix}_best_trainloss.pt")
+                train_path = os.path.join(args.ckpt_dir, f"{ckpt_base}_best_trainloss.pt")
                 torch.save(ckpt_common, train_path)
                 print(f"Saved checkpoint (no val): {train_path} (train_loss={avg_train_loss:.6f})")
             else:
@@ -940,25 +1317,39 @@ def main():
     print("Starting Evaluation...")
     results = {}
 
+    # Track which adapter checkpoint was selected/loaded during evaluation (for JSON logging)
+    eval_ckpt_to_load = None
+    eval_ckpt_loaded = False
+    eval_adapter_name = model.adapter.__class__.__name__ if (model.adapter is not None) else None
+
     # Load best adapter weights for evaluation (if adapter is enabled)
     if (not args.no_adapter) and (model.adapter is not None):
         ckpt_to_load = None
         if args.eval_adapter_ckpt:
             ckpt_to_load = args.eval_adapter_ckpt
         else:
-            best_path = os.path.join(args.ckpt_dir, f"{args.ckpt_prefix}_best.pt")
-            best_trainloss_path = os.path.join(args.ckpt_dir, f"{args.ckpt_prefix}_best_trainloss.pt")
-            last_path = os.path.join(args.ckpt_dir, f"{args.ckpt_prefix}_last.pt")
-            for p in (best_path, best_trainloss_path, last_path):
-                if os.path.isfile(p):
-                    ckpt_to_load = p
-                    break
+            adapter_name = model.adapter.__class__.__name__
+            ckpt_to_load = _find_latest_ckpt(
+                args.ckpt_dir,
+                patterns=[
+                    f"*{adapter_name}*_best.pt",
+                    f"*{adapter_name}*_best_trainloss.pt",
+                    f"*{adapter_name}*_last.pt",
+                    # "*_best.pt",
+                    # "*_best_trainloss.pt",
+                    # "*_last.pt",
+                ],
+            )
+
+        eval_ckpt_to_load = ckpt_to_load
+        eval_adapter_name = model.adapter.__class__.__name__
 
         if ckpt_to_load is not None and os.path.isfile(ckpt_to_load):
             ckpt = torch.load(ckpt_to_load, map_location="cpu")
             adapter_state = ckpt.get("adapter_state_dict", ckpt)
             model.adapter.load_state_dict(adapter_state)
             model.adapter.to(device)
+            eval_ckpt_loaded = True
             print(f"[Eval] Loaded adapter weights: {ckpt_to_load}")
         else:
             print("[Eval] No adapter checkpoint found; using current adapter weights.")
@@ -977,7 +1368,15 @@ def main():
         batch_size=8,
     )
     
-    all_datasets = sorted(reader.dataset_list_ucr)
+    # Dataset selection for evaluation
+    if args.use_uea_eval:
+        all_datasets = sorted(reader.dataset_list_ucr + reader.dataset_list_uea)
+    else:
+        all_datasets = sorted(reader.dataset_list_ucr)
+    print(
+        f"[Data] Eval datasets: UCR={len(reader.dataset_list_ucr)} "
+        f"UEA={'on' if args.use_uea_eval else 'off'} (total={len(all_datasets)})"
+    )
     for dataset_name in tqdm(all_datasets, desc="Evaluating"):
         try:
             is_uea = dataset_name in reader.dataset_list_uea
@@ -1044,6 +1443,42 @@ def main():
         with open(args.output_file, 'w') as f:
             json.dump(structured_results, f, indent=4)
         print(f"Results saved to {args.output_file}")
+
+    # Append experiment results into the same args JSON log file
+    if args_log_path is not None:
+        try:
+            payload = args_payload if isinstance(args_payload, dict) else {}
+            payload["results"] = {
+                "UEA": uea_results,
+                "UCR": ucr_results,
+            }
+            payload["eval"] = {
+                "adapter_name": eval_adapter_name,
+                "ckpt_to_load": eval_ckpt_to_load,
+                "ckpt_loaded": bool(eval_ckpt_loaded),
+                "ckpt_dir": getattr(args, "ckpt_dir", None),
+                "eval_adapter_ckpt_arg": getattr(args, "eval_adapter_ckpt", None),
+            }
+            payload["metrics"] = {
+                "avg_uea_acc": float(np.mean(list(uea_results.values()))) if uea_results else None,
+                "avg_ucr_acc": float(np.mean(list(ucr_results.values()))) if ucr_results else None,
+                "overall_avg_acc": float(np.mean(list(results.values()))) if results else None,
+                "num_datasets": int(len(results)),
+                "num_uea": int(len(uea_results)),
+                "num_ucr": int(len(ucr_results)),
+                "use_uea_pretrain": bool(getattr(args, "use_uea_pretrain", True)),
+                "use_uea_eval": bool(getattr(args, "use_uea_eval", True)),
+            }
+            payload["data"] = {
+                "eval_dataset_scope": "UCR+UEA" if getattr(args, "use_uea_eval", True) else "UCR",
+                "pretrain_dataset_scope": "UCR+UEA" if getattr(args, "use_uea_pretrain", True) else "UCR",
+            }
+            payload["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(args_log_path, "w") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+            print(f"[Run] Updated args log with results: {args_log_path}")
+        except Exception as e:
+            print(f"[Run][warn] Failed to update args log with results: {e}")
 
 if __name__ == "__main__":
     main()

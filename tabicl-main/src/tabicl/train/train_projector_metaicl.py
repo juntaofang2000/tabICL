@@ -631,5 +631,83 @@ def main():
             "args": vars(args)
         }, ckpt_path)
 
+    # --- Evaluation Phase ---
+    print("Starting Evaluation...")
+    results = {}
+    
+    # Initialize Classifier for evaluation
+    clf = TabICLClassifier(
+        model_path=args.tabicl_ckpt,
+        n_estimators=32,
+        device=device,
+        verbose=False,
+        mantis_checkpoint=None,
+        batch_size=8,
+    )
+    
+    all_datasets = sorted(reader.dataset_list_ucr + reader.dataset_list_uea)
+    for dataset_name in tqdm(all_datasets, desc="Evaluating"):
+        try:
+            X_train, y_train, X_test, y_test = load_dataset_data(reader, dataset_name)
+            if X_train is None:
+                continue
+                
+            # Extract embeddings
+            X_train_emb = get_embeddings(model, X_train, device)
+            X_test_emb = get_embeddings(model, X_test, device)
+            
+            # Fit and Predict
+            clf.fit(X_train_emb, y_train.numpy())
+            y_pred = clf.predict(X_test_emb)
+            acc = np.mean(y_pred == y_test.numpy())
+            
+            results[dataset_name] = acc
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                print(f"\nSkipping {dataset_name} due to OOM")
+                torch.cuda.empty_cache()
+                continue
+            else:
+                raise e
+        except Exception as e:
+            print(f"\nError evaluating {dataset_name}: {e}")
+            continue
+
+    print("\nFinal Results:")
+    
+    uea_results = {name: acc for name, acc in results.items() if name in reader.dataset_list_uea}
+    ucr_results = {name: acc for name, acc in results.items() if name in reader.dataset_list_ucr}
+    
+    if uea_results:
+        print(f"\n--- UEA Benchmark ({len(uea_results)} datasets) ---")
+        for name in sorted(uea_results.keys()):
+            print(f"{name}: {uea_results[name]:.4f}")
+        print(f"Average UEA Accuracy: {np.mean(list(uea_results.values())):.4f}")
+
+    if ucr_results:
+        print(f"\n--- UCR Benchmark ({len(ucr_results)} datasets) ---")
+        for name in sorted(ucr_results.keys()):
+            print(f"{name}: {ucr_results[name]:.4f}")
+        print(f"Average UCR Accuracy: {np.mean(list(ucr_results.values())):.4f}")
+        
+    print(f"\nOverall Average Accuracy: {np.mean(list(results.values())):.4f}")
+
+    if args.output_file:
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(os.path.abspath(args.output_file)), exist_ok=True)
+        
+        # Save structured results separating UEA and UCR
+        structured_results = {
+            "UEA": uea_results,
+            "UCR": ucr_results,
+            "overall_avg": np.mean(list(results.values())) if results else 0.0,
+            "uea_avg": np.mean(list(uea_results.values())) if uea_results else 0.0,
+            "ucr_avg": np.mean(list(ucr_results.values())) if ucr_results else 0.0
+        }
+        
+        with open(args.output_file, "w") as f:
+            json.dump(structured_results, f, indent=4)
+        print(f"Results saved to {args.output_file}")
+
 if __name__ == "__main__":
     main()
