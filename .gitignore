@@ -1,0 +1,6 @@
+﻿# training artifacts / checkpoints
+**/checkpoints/
+**/*.ckpt
+**/*.pt
+**/*.pth
+**/*.bin
