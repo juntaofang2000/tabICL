@@ -1,0 +1,18 @@
+{
+  "trial": 2,
+  "best_epoch": 0,
+  "best_val_loss": 1.027741455606052,
+  "params": {
+    "mcm_num_heads": 4,
+    "mcm_dropout": 0.11973169683940732,
+    "bottleneck_dropout": 0.031203728088487304,
+    "lr": 2.4345423962016926e-05,
+    "weight_decay": 1.7073967431528114e-06,
+    "n_augmentations": 7,
+    "meta_batch_size": 12,
+    "train_size": 64,
+    "max_icl_len": 384,
+    "mantis_batch_size": 64
+  },
+  "timing_sec": 543.2918164730072
+}

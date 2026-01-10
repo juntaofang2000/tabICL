@@ -37,7 +37,7 @@ from tabicl.train.train_config import build_parser
 from tabicl.model.mantis_tabicl import build_mantis_encoder
 from tabicl.model.mantis_adapter_icl import MantisAdapterICL, TokenMLPAdapter
 
-
+# 保存
 warnings.filterwarnings(
     "ignore", message=".*The PyTorch API of nested tensors is in prototype stage.*", category=UserWarning
 )

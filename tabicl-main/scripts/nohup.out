@@ -1,0 +1,173 @@
+[I 2026-01-05 22:46:34,056] Using an existing study with name 'calda_v2_search' instead of creating a new one.
+[I 2026-01-05 22:55:37,840] Trial 2 finished with value: 1.027741455606052 and parameters: {'mcm_num_heads': 4, 'mcm_dropout': 0.11973169683940732, 'bottleneck_dropout': 0.031203728088487304, 'lr': 2.4345423962016926e-05, 'weight_decay': 1.7073967431528114e-06, 'n_augmentations': 7, 'meta_batch_size': 12, 'train_size': 64, 'max_icl_len': 384, 'mantis_batch_size': 64}. Best is trial 2 with value: 1.027741455606052.
+[I 2026-01-05 23:03:12,247] Trial 3 finished with value: 0.9547748868664107 and parameters: {'mcm_num_heads': 8, 'mcm_dropout': 0.15703519227860274, 'bottleneck_dropout': 0.03993475643167195, 'lr': 0.00018785426399210597, 'weight_decay': 0.00023423849847112912, 'n_augmentations': 1, 'meta_batch_size': 16, 'train_size': 64, 'max_icl_len': 256, 'mantis_batch_size': 128}. Best is trial 3 with value: 0.9547748868664107.
+[I 2026-01-05 23:06:05,008] Trial 4 finished with value: 0.5968569804515157 and parameters: {'mcm_num_heads': 4, 'mcm_dropout': 0.10401360423556216, 'bottleneck_dropout': 0.10934205586865593, 'lr': 2.8701652421858168e-05, 'weight_decay': 0.00755681014127443, 'n_augmentations': 7, 'meta_batch_size': 2, 'train_size': 256, 'max_icl_len': 512, 'mantis_batch_size': 128}. Best is trial 4 with value: 0.5968569804515157.
+[I 2026-01-05 23:13:35,620] Trial 5 finished with value: 1.050937633358297 and parameters: {'mcm_num_heads': 4, 'mcm_dropout': 0.19737738732010346, 'bottleneck_dropout': 0.1544489538593315, 'lr': 3.106296006733529e-05, 'weight_decay': 1.0521761868451139e-06, 'n_augmentations': 7, 'meta_batch_size': 8, 'train_size': 128, 'max_icl_len': 256, 'mantis_batch_size': 64}. Best is trial 4 with value: 0.5968569804515157.
+[I 2026-01-05 23:15:14,448] Trial 6 finished with value: 0.6597642909735442 and parameters: {'mcm_num_heads': 2, 'mcm_dropout': 0.14264895744459902, 'bottleneck_dropout': 0.1521570097233795, 'lr': 0.00024566974547738323, 'weight_decay': 0.0012130221181165164, 'n_augmentations': 4, 'meta_batch_size': 2, 'train_size': 64, 'max_icl_len': 256, 'mantis_batch_size': 32}. Best is trial 4 with value: 0.5968569804515157.
+[I 2026-01-05 23:19:07,470] Trial 7 pruned. pruned at epoch=1, val_loss=1.0667295306921005
+[I 2026-01-05 23:22:02,516] Trial 8 finished with value: 0.6477098107337952 and parameters: {'mcm_num_heads': 8, 'mcm_dropout': 0.06464058640415105, 'bottleneck_dropout': 0.10375812434867322, 'lr': 0.0005513954848805307, 'weight_decay': 2.847858516856295e-05, 'n_augmentations': 8, 'meta_batch_size': 2, 'train_size': 128, 'max_icl_len': 512, 'mantis_batch_size': 128}. Best is trial 4 with value: 0.5968569804515157.
+[I 2026-01-05 23:28:42,307] Trial 9 pruned. pruned at epoch=1, val_loss=0.9983290664023823
+[I 2026-01-05 23:35:47,477] Trial 10 pruned. pruned at epoch=1, val_loss=1.020721135661006
+[I 2026-01-05 23:37:00,814] Trial 11 pruned. pruned at epoch=1, val_loss=1.0742688938975333
+[I 2026-01-05 23:39:07,982] Trial 12 finished with value: 0.5530535466969013 and parameters: {'mcm_num_heads': 4, 'mcm_dropout': 0.07756943482149943, 'bottleneck_dropout': 0.19390742215757317, 'lr': 6.354220811343265e-05, 'weight_decay': 0.008621440679929909, 'n_augmentations': 4, 'meta_batch_size': 2, 'train_size': 256, 'max_icl_len': 512, 'mantis_batch_size': 128}. Best is trial 12 with value: 0.5530535466969013.
+[I 2026-01-05 23:41:07,172] Trial 13 finished with value: 0.6232094645500184 and parameters: {'mcm_num_heads': 4, 'mcm_dropout': 0.08144501399609938, 'bottleneck_dropout': 0.19130938968443198, 'lr': 6.787143700849738e-05, 'weight_decay': 0.009462889395526376, 'n_augmentations': 4, 'meta_batch_size': 2, 'train_size': 256, 'max_icl_len': 512, 'mantis_batch_size': 128}. Best is trial 12 with value: 0.5530535466969013.
+[I 2026-01-05 23:42:29,951] Trial 14 pruned. pruned at epoch=1, val_loss=0.8945387795567512
+[I 2026-01-05 23:43:50,001] Trial 15 finished with value: 0.71494709054629 and parameters: {'mcm_num_heads': 4, 'mcm_dropout': 0.10793250829975899, 'bottleneck_dropout': 0.08452300531254875, 'lr': 6.407455575051123e-05, 'weight_decay': 0.00976448442254653, 'n_augmentations': 3, 'meta_batch_size': 2, 'train_size': 256, 'max_icl_len': 512, 'mantis_batch_size': 128}. Best is trial 12 with value: 0.5530535466969013.
+[I 2026-01-05 23:50:19,457] Trial 16 pruned. pruned at epoch=1, val_loss=1.0674224440256752
+[I 2026-01-05 23:52:16,583] Trial 17 pruned. pruned at epoch=1, val_loss=0.9217532242337863
+[I 2026-01-05 23:54:10,134] Trial 18 finished with value: 0.6196726302305857 and parameters: {'mcm_num_heads': 4, 'mcm_dropout': 0.11849762420491286, 'bottleneck_dropout': 0.12402978155691148, 'lr': 0.0001135964611204051, 'weight_decay': 5.5567989531313976e-05, 'n_augmentations': 3, 'meta_batch_size': 2, 'train_size': 128, 'max_icl_len': 512, 'mantis_batch_size': 128}. Best is trial 12 with value: 0.5530535466969013.
+[I 2026-01-05 23:55:34,447] Trial 19 pruned. pruned at epoch=1, val_loss=0.9166872958342234
+[I 2026-01-05 23:57:16,964] Trial 20 finished with value: 0.6106120109558106 and parameters: {'mcm_num_heads': 4, 'mcm_dropout': 0.002393342077763247, 'bottleneck_dropout': 0.11895222880747085, 'lr': 0.00013475399716660164, 'weight_decay': 0.0036448349390398684, 'n_augmentations': 3, 'meta_batch_size': 2, 'train_size': 256, 'max_icl_len': 384, 'mantis_batch_size': 32}. Best is trial 12 with value: 0.5530535466969013.
+[I 2026-01-06 00:02:23,947] Trial 21 pruned. pruned at epoch=1, val_loss=1.0649485559690568
+[I 2026-01-06 00:04:41,100] Trial 22 pruned. pruned at epoch=1, val_loss=1.0087506705522535
+[I 2026-01-06 00:06:38,177] Trial 23 finished with value: 0.7429486254851023 and parameters: {'mcm_num_heads': 4, 'mcm_dropout': 0.04925155407797869, 'bottleneck_dropout': 0.10972579937953698, 'lr': 0.00011687798624442346, 'weight_decay': 0.003498086373209985, 'n_augmentations': 3, 'meta_batch_size': 2, 'train_size': 256, 'max_icl_len': 384, 'mantis_batch_size': 32}. Best is trial 12 with value: 0.5530535466969013.
+[I 2026-01-06 00:08:24,320] Trial 24 finished with value: 0.5339886739850044 and parameters: {'mcm_num_heads': 4, 'mcm_dropout': 0.004146916622771071, 'bottleneck_dropout': 0.13165120937031005, 'lr': 0.00010641284447771964, 'weight_decay': 0.004379972263907993, 'n_augmentations': 2, 'meta_batch_size': 2, 'train_size': 256, 'max_icl_len': 384, 'mantis_batch_size': 32}. Best is trial 24 with value: 0.5339886739850044.
+[I 2026-01-06 00:09:58,869] Trial 25 finished with value: 0.7392458915710449 and parameters: {'mcm_num_heads': 4, 'mcm_dropout': 0.132922623892972, 'bottleneck_dropout': 0.13565909822803582, 'lr': 4.659421322364608e-05, 'weight_decay': 0.006281893553915114, 'n_augmentations': 2, 'meta_batch_size': 2, 'train_size': 256, 'max_icl_len': 384, 'mantis_batch_size': 32}. Best is trial 24 with value: 0.5339886739850044.
+[I 2026-01-06 00:11:51,347] Trial 26 finished with value: 0.5725967824459076 and parameters: {'mcm_num_heads': 4, 'mcm_dropout': 0.002779511635803353, 'bottleneck_dropout': 0.1738819074083477, 'lr': 9.144163272017544e-05, 'weight_decay': 0.002710579652325481, 'n_augmentations': 2, 'meta_batch_size': 2, 'train_size': 256, 'max_icl_len': 384, 'mantis_batch_size': 32}. Best is trial 24 with value: 0.5339886739850044.
+[I 2026-01-06 00:17:18,245] Trial 27 pruned. pruned at epoch=1, val_loss=1.028863003104925
+[I 2026-01-06 00:19:14,614] Trial 28 finished with value: 0.6497896850109101 and parameters: {'mcm_num_heads': 4, 'mcm_dropout': 0.021366119005535738, 'bottleneck_dropout': 0.17494320900432894, 'lr': 8.738560584545686e-05, 'weight_decay': 0.0001235209188405673, 'n_augmentations': 1, 'meta_batch_size': 2, 'train_size': 256, 'max_icl_len': 384, 'mantis_batch_size': 32}. Best is trial 24 with value: 0.5339886739850044.
+[I 2026-01-06 00:21:34,843] Trial 29 finished with value: 0.6148389935493469 and parameters: {'mcm_num_heads': 4, 'mcm_dropout': 0.04318420421886789, 'bottleneck_dropout': 0.18527930287579433, 'lr': 0.00018115016013598033, 'weight_decay': 0.0010843838119879276, 'n_augmentations': 2, 'meta_batch_size': 2, 'train_size': 256, 'max_icl_len': 384, 'mantis_batch_size': 32}. Best is trial 24 with value: 0.5339886739850044.
+[I 2026-01-06 00:23:09,224] Trial 30 finished with value: 0.6183406438678503 and parameters: {'mcm_num_heads': 8, 'mcm_dropout': 0.015232396746867185, 'bottleneck_dropout': 0.1644336813433815, 'lr': 0.00040509632342345314, 'weight_decay': 0.000662842483296212, 'n_augmentations': 4, 'meta_batch_size': 2, 'train_size': 128, 'max_icl_len': 384, 'mantis_batch_size': 32}. Best is trial 24 with value: 0.5339886739850044.
+[I 2026-01-06 00:26:07,097] Trial 31 pruned. pruned at epoch=1, val_loss=1.0236956807474296
+[I 2026-01-06 00:29:33,263] Trial 32 finished with value: 0.8141348304847877 and parameters: {'mcm_num_heads': 4, 'mcm_dropout': 0.03355070846620633, 'bottleneck_dropout': 0.19808324743675765, 'lr': 0.0029113644785188557, 'weight_decay': 0.0025633728820044564, 'n_augmentations': 3, 'meta_batch_size': 4, 'train_size': 64, 'max_icl_len': 384, 'mantis_batch_size': 32}. Best is trial 24 with value: 0.5339886739850044.
+[I 2026-01-06 00:30:57,479] Trial 33 pruned. pruned at epoch=1, val_loss=0.8534680031239986
+[I 2026-01-06 00:32:32,877] Trial 34 finished with value: 0.6067354425787925 and parameters: {'mcm_num_heads': 4, 'mcm_dropout': 0.12737353603851181, 'bottleneck_dropout': 0.161034267137732, 'lr': 3.151611786064894e-05, 'weight_decay': 0.009127645752704064, 'n_augmentations': 1, 'meta_batch_size': 2, 'train_size': 256, 'max_icl_len': 384, 'mantis_batch_size': 128}. Best is trial 24 with value: 0.5339886739850044.
+[I 2026-01-06 00:40:43,910] Trial 35 pruned. pruned at epoch=1, val_loss=1.0814489115561758
+[I 2026-01-06 00:43:55,489] Trial 36 pruned. pruned at epoch=1, val_loss=1.0465408176183701
+[I 2026-01-06 00:45:39,716] Trial 37 finished with value: 0.6546042129397392 and parameters: {'mcm_num_heads': 4, 'mcm_dropout': 0.1155486967915755, 'bottleneck_dropout': 0.18405123567924409, 'lr': 0.0001577457197770206, 'weight_decay': 0.003700217600644205, 'n_augmentations': 2, 'meta_batch_size': 2, 'train_size': 64, 'max_icl_len': 384, 'mantis_batch_size': 32}. Best is trial 24 with value: 0.5339886739850044.
+[I 2026-01-06 00:48:10,618] Trial 38 finished with value: 0.47468747322758037 and parameters: {'mcm_num_heads': 8, 'mcm_dropout': 0.07311506064978189, 'bottleneck_dropout': 0.09485425443411938, 'lr': 0.00024035503448636384, 'weight_decay': 0.0001247445714950691, 'n_augmentations': 6, 'meta_batch_size': 2, 'train_size': 256, 'max_icl_len': 512, 'mantis_batch_size': 128}. Best is trial 38 with value: 0.47468747322758037.
+[I 2026-01-06 00:54:27,874] Trial 39 pruned. pruned at epoch=1, val_loss=1.1042017764515346
+[I 2026-01-06 00:57:01,031] Trial 40 finished with value: 0.5859511131048202 and parameters: {'mcm_num_heads': 8, 'mcm_dropout': 0.05448996458792738, 'bottleneck_dropout': 0.09152824388642927, 'lr': 0.0002098174786714891, 'weight_decay': 9.375237052721127e-06, 'n_augmentations': 5, 'meta_batch_size': 2, 'train_size': 128, 'max_icl_len': 256, 'mantis_batch_size': 128}. Best is trial 38 with value: 0.47468747322758037.
+[I 2026-01-06 01:00:21,732] Trial 41 finished with value: 0.5988527111709118 and parameters: {'mcm_num_heads': 8, 'mcm_dropout': 0.037006066114551775, 'bottleneck_dropout': 0.13250312143033147, 'lr': 0.0007773325305991633, 'weight_decay': 6.310463413491931e-05, 'n_augmentations': 4, 'meta_batch_size': 2, 'train_size': 256, 'max_icl_len': 384, 'mantis_batch_size': 64}. Best is trial 38 with value: 0.47468747322758037.
+[I 2026-01-06 01:04:58,665] Trial 42 pruned. pruned at epoch=1, val_loss=0.993984008497662
+[I 2026-01-06 01:07:54,853] Trial 43 finished with value: 0.4528474217653275 and parameters: {'mcm_num_heads': 8, 'mcm_dropout': 0.07130826311317541, 'bottleneck_dropout': 0.09484260007283046, 'lr': 0.00021663747684229232, 'weight_decay': 1.3789388637504615e-05, 'n_augmentations': 5, 'meta_batch_size': 2, 'train_size': 128, 'max_icl_len': 256, 'mantis_batch_size': 128}. Best is trial 43 with value: 0.4528474217653275.
+[I 2026-01-06 01:11:57,589] Trial 44 finished with value: 0.7565008757015068 and parameters: {'mcm_num_heads': 8, 'mcm_dropout': 0.08811434912761867, 'bottleneck_dropout': 0.09863852647202646, 'lr': 0.00021263494263273113, 'weight_decay': 1.3177401129303563e-05, 'n_augmentations': 6, 'meta_batch_size': 2, 'train_size': 128, 'max_icl_len': 256, 'mantis_batch_size': 128}. Best is trial 43 with value: 0.4528474217653275.
+[I 2026-01-06 01:15:25,634] Trial 45 finished with value: 0.4924790285527706 and parameters: {'mcm_num_heads': 8, 'mcm_dropout': 0.07222171799916434, 'bottleneck_dropout': 0.05455786309751415, 'lr': 0.00032900939198135125, 'weight_decay': 1.860461481830267e-06, 'n_augmentations': 6, 'meta_batch_size': 2, 'train_size': 128, 'max_icl_len': 256, 'mantis_batch_size': 128}. Best is trial 43 with value: 0.4528474217653275.
+[I 2026-01-06 01:20:21,868] Trial 46 finished with value: 0.717156499198505 and parameters: {'mcm_num_heads': 8, 'mcm_dropout': 0.07141029259803475, 'bottleneck_dropout': 0.05056047103703315, 'lr': 0.0003027281785741376, 'weight_decay': 1.5458554799690498e-06, 'n_augmentations': 7, 'meta_batch_size': 2, 'train_size': 128, 'max_icl_len': 256, 'mantis_batch_size': 128}. Best is trial 43 with value: 0.4528474217653275.
+[I 2026-01-06 01:23:20,186] Trial 47 finished with value: 0.6193899011611939 and parameters: {'mcm_num_heads': 8, 'mcm_dropout': 0.05700869645074545, 'bottleneck_dropout': 0.012016761368395391, 'lr': 0.0008823566605255655, 'weight_decay': 2.723354945224091e-06, 'n_augmentations': 5, 'meta_batch_size': 2, 'train_size': 128, 'max_icl_len': 256, 'mantis_batch_size': 128}. Best is trial 43 with value: 0.4528474217653275.
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[I 2026-01-06 01:33:57,904] Trial 48 pruned. pruned at epoch=1, val_loss=0.9930550527241495
+[I 2026-01-06 01:44:47,718] Trial 49 pruned. pruned at epoch=1, val_loss=1.0369238656191597
+[I 2026-01-06 01:47:20,166] Trial 50 finished with value: 0.6385300958156586 and parameters: {'mcm_num_heads': 8, 'mcm_dropout': 0.06525477758767949, 'bottleneck_dropout': 0.07756432795248985, 'lr': 0.0005233530879734891, 'weight_decay': 3.2563589148673576e-06, 'n_augmentations': 5, 'meta_batch_size': 2, 'train_size': 128, 'max_icl_len': 256, 'mantis_batch_size': 128}. Best is trial 43 with value: 0.4528474217653275.
+[I 2026-01-06 01:50:00,073] Trial 51 finished with value: 0.6584070975581805 and parameters: {'mcm_num_heads': 8, 'mcm_dropout': 0.0864088161328851, 'bottleneck_dropout': 0.11652409739234819, 'lr': 0.00022359662997992454, 'weight_decay': 1.1161483511990885e-06, 'n_augmentations': 6, 'meta_batch_size': 2, 'train_size': 128, 'max_icl_len': 256, 'mantis_batch_size': 128}. Best is trial 43 with value: 0.4528474217653275.
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+Loading weights from local directory
+[MantisTabICL] Loaded pretrained Mantis encoder from /data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/Models/Mantis/Mantis_cheickpoint
+[Optuna] Finished.
+{
+  "study_name": "calda_v2_search",
+  "direction": "MINIMIZE",
+  "best_value": 0.4528474217653275,
+  "best_params": {
+    "mcm_num_heads": 8,
+    "mcm_dropout": 0.07130826311317541,
+    "bottleneck_dropout": 0.09484260007283046,
+    "lr": 0.00021663747684229232,
+    "weight_decay": 1.3789388637504615e-05,
+    "n_augmentations": 5,
+    "meta_batch_size": 2,
+    "train_size": 128,
+    "max_icl_len": 256,
+    "mantis_batch_size": 128
+  },
+  "best_trial_number": 43,
+  "n_trials": 52,
+  "storage": "sqlite:///optuna_calda_v2.db",
+  "finished_at": "2026-01-06 01:50:00"
+}
