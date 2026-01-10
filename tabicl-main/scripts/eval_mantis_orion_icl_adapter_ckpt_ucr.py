@@ -9,17 +9,18 @@ import torch
 from torch import nn
 
 
-# Ensure we import the local workspace package (repo_root/src/tabicl)
+# Ensure we import the local workspace package (repo_root/src)
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 _SRC_DIR = _REPO_ROOT / "src"
 if str(_SRC_DIR) not in sys.path:
     sys.path.insert(0, str(_SRC_DIR))
 
-from tabicl import TabICL  # noqa: E402
 from tabicl.model.mantis_adapter_icl import TokenMLPAdapter  # noqa: E402
 from tabicl.model.mantis_tabicl import build_mantis_encoder  # noqa: E402
 from tabicl.prior.data_reader import DataReader  # noqa: E402
-from tabicl.sklearn.classifier import MantisICLClassifier, MantisICLClassifierV2  # noqa: E402
+from tabicl.sklearn.classifier import MantisICLClassifierV2  # noqa: E402
+
+from orion_msp.model.orion_msp import OrionMSP  # noqa: E402
 
 
 def _remap_labels(y_train: np.ndarray, y_test: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -58,93 +59,16 @@ def _select_support_indices(y: np.ndarray, support_size: int, seed: int) -> np.n
             continue
         pick = int(rng.choice(idx))
         chosen.append(pick)
-        # store the rest as remaining pool
         remaining.extend([int(i) for i in idx if int(i) != pick])
-
-    if len(chosen) > support_size:
-        # Extremely rare: support_size < n_classes handled above; keep a stable subset anyway
-        chosen = chosen[:support_size]
 
     need = support_size - len(chosen)
     if need > 0:
-        remaining = np.array(remaining, dtype=np.int64)
-        if remaining.size > 0:
-            extra = rng.choice(remaining, size=min(need, remaining.size), replace=False)
+        remaining_np = np.array(remaining, dtype=np.int64)
+        if remaining_np.size > 0:
+            extra = rng.choice(remaining_np, size=min(need, remaining_np.size), replace=False)
             chosen.extend([int(i) for i in extra])
 
     return np.array(chosen, dtype=np.int64)
-
-
-@torch.no_grad()
-def _predict_direct(
-    model: "_MantisAdapterPlusICL",
-    *,
-    X_support: np.ndarray,
-    y_support: np.ndarray,
-    X_query: np.ndarray,
-    query_batch_size: int,
-    softmax_temperature: float,
-    mgr_config=None,
-) -> np.ndarray:
-    """Directly predict labels for X_query using (support + query) ICL tables.
-
-    This avoids sklearn pipeline and caches support representations.
-    """
-
-    device = next(model.adapter.parameters()).device
-    X_support_t = torch.from_numpy(X_support.astype(np.float32)).to(device)
-    X_query_t = torch.from_numpy(X_query.astype(np.float32)).to(device)
-    y_support_t = torch.from_numpy(y_support.astype(np.float32)).to(device)
-
-    # Shapes: support (S, L) -> (1, S, L), query (N, L) -> (B, 1, L)
-    X_support_t = X_support_t.unsqueeze(0)
-    y_support_t = y_support_t.unsqueeze(0)
-
-    support_rep = model.adapter(model._encode(X_support_t))  # (1, S, D)
-
-    preds: list[np.ndarray] = []
-    bs = max(1, int(query_batch_size))
-    for i in range(0, X_query_t.shape[0], bs):
-        q = X_query_t[i : i + bs].unsqueeze(1)  # (B, 1, L)
-        query_rep = model.adapter(model._encode(q))  # (B, 1, D)
-
-        B = query_rep.shape[0]
-        reps_all = torch.cat([support_rep.repeat(B, 1, 1), query_rep], dim=1)  # (B, S+1, D)
-        y_train = y_support_t.repeat(B, 1)  # (B, S)
-
-        logits = model.icl_predictor(
-            reps_all,
-            y_train=y_train,
-            return_logits=True,
-            softmax_temperature=float(softmax_temperature),
-            mgr_config=mgr_config,
-        )
-        # logits: (B, 1, num_classes)
-        pred = torch.argmax(logits[:, 0, :], dim=-1).detach().cpu().numpy()
-        preds.append(pred)
-
-    return np.concatenate(preds, axis=0)
-
-
-def _load_tabicl_checkpoint(path: str) -> tuple[TabICL, dict]:
-    ckpt = torch.load(path, map_location="cpu")
-    if not isinstance(ckpt, dict) or "config" not in ckpt:
-        raise ValueError("TabICL checkpoint must be a dict containing 'config'.")
-
-    state_dict = ckpt.get("state_dict")
-    if state_dict is None:
-        for k in ("model_state_dict", "model"):
-            if k in ckpt and isinstance(ckpt[k], dict):
-                state_dict = ckpt[k]
-                break
-    if state_dict is None or not isinstance(state_dict, dict):
-        raise ValueError("TabICL checkpoint must contain a model state dict ('state_dict' or similar).")
-
-    cleaned = {k.replace("module.", ""): v for k, v in state_dict.items()}
-    model = TabICL(**ckpt["config"])
-    model.load_state_dict(cleaned, strict=False)
-    model.eval()
-    return model, ckpt["config"]
 
 
 def _ensure_2d_timeseries(X: np.ndarray) -> np.ndarray:
@@ -172,10 +96,31 @@ def _find_latest_adapter_ckpt(dir_path: str) -> str:
     return str(candidates[0])
 
 
-class _MantisAdapterPlusICL(nn.Module):
-    """Mantis encoder -> Adapter -> TabICL icl_predictor.
+def _load_orion_checkpoint(path: str) -> tuple[OrionMSP, dict]:
+    ckpt = torch.load(path, map_location="cpu")
+    if not isinstance(ckpt, dict) or "config" not in ckpt:
+        raise ValueError("OrionMSP checkpoint must be a dict containing 'config'.")
 
-    Implements the forward signature expected by MantisICLClassifier._batch_forward.
+    state_dict = ckpt.get("state_dict")
+    if state_dict is None:
+        for k in ("model_state_dict", "model"):
+            if k in ckpt and isinstance(ckpt[k], dict):
+                state_dict = ckpt[k]
+                break
+    if state_dict is None or not isinstance(state_dict, dict):
+        raise ValueError("OrionMSP checkpoint must contain a model state dict ('state_dict' or similar).")
+
+    cleaned = {k.replace("module.", ""): v for k, v in state_dict.items()}
+    model = OrionMSP(**ckpt["config"])
+    model.load_state_dict(cleaned, strict=False)
+    model.eval()
+    return model, ckpt["config"]
+
+
+class _MantisAdapterPlusOrionICL(nn.Module):
+    """Mantis encoder -> Adapter -> OrionMSP icl_predictor.
+
+    Implements the forward signature expected by MantisICLClassifierV2.
     """
 
     def __init__(
@@ -231,6 +176,12 @@ class _MantisAdapterPlusICL(nn.Module):
         reps = torch.cat(reps, dim=0)
         return reps.reshape(B, T, -1)
 
+    @torch.no_grad()
+    def encode_and_adapt(self, X: torch.Tensor) -> torch.Tensor:
+        reps = self._encode(X)
+        reps = reps.to(X.device)
+        return self.adapter(reps)
+
     def forward(
         self,
         X: torch.Tensor,
@@ -242,29 +193,81 @@ class _MantisAdapterPlusICL(nn.Module):
         softmax_temperature: float = 0.9,
         inference_config=None,
     ) -> torch.Tensor:
-        # feature_shuffles/embed_with_test/d are ignored for this path
+        # d/feature_shuffles/embed_with_test are ignored in this path.
+        # NOTE: classifier_v2 runs in eval/no_grad outside; keep this forward lightweight.
         reps = self._encode(X)
         reps = reps.to(X.device)
         reps = self.adapter(reps)
 
+        # Orion ICL accepts mgr_config (MgrConfig). We keep it None by default.
         mgr_config = None
         if inference_config is not None and hasattr(inference_config, "ICL_CONFIG"):
-            mgr_config = inference_config.ICL_CONFIG
+            # `inference_config` here is tabicl.InferenceConfig. Its ICL_CONFIG type is
+            # not guaranteed to match orion_msp.model.inference_config.MgrConfig, so we
+            # intentionally do not pass it through.
+            mgr_config = None
 
         return self.icl_predictor(
             reps,
             y_train=y_train,
-            return_logits=return_logits,
+            return_logits=bool(return_logits),
             softmax_temperature=float(softmax_temperature),
             mgr_config=mgr_config,
         )
 
 
+@torch.no_grad()
+def _predict_direct(
+    model: _MantisAdapterPlusOrionICL,
+    *,
+    X_support: np.ndarray,
+    y_support: np.ndarray,
+    X_query: np.ndarray,
+    query_batch_size: int,
+    softmax_temperature: float,
+) -> np.ndarray:
+    """Directly predict labels for X_query using (support + query) ICL tables."""
+
+    device = next(model.adapter.parameters()).device
+    X_support_t = torch.from_numpy(X_support.astype(np.float32)).to(device)
+    X_query_t = torch.from_numpy(X_query.astype(np.float32)).to(device)
+    y_support_t = torch.from_numpy(y_support.astype(np.float32)).to(device)
+
+    # support: (S,L) -> (1,S,L), query: (N,L) -> (B,1,L)
+    X_support_t = X_support_t.unsqueeze(0)
+    y_support_t = y_support_t.unsqueeze(0)
+
+    support_rep = model.encode_and_adapt(X_support_t)  # (1,S,D)
+
+    preds: list[np.ndarray] = []
+    bs = max(1, int(query_batch_size))
+    for i in range(0, X_query_t.shape[0], bs):
+        q = X_query_t[i : i + bs].unsqueeze(1)  # (B,1,L)
+        query_rep = model.encode_and_adapt(q)  # (B,1,D)
+
+        B = query_rep.shape[0]
+        reps_all = torch.cat([support_rep.repeat(B, 1, 1), query_rep], dim=1)  # (B,S+1,D)
+        y_train = y_support_t.repeat(B, 1)  # (B,S)
+
+        # Orion ICL forward returns logits/probs for test region only in eval mode.
+        logits = model.icl_predictor(
+            reps_all,
+            y_train=y_train,
+            return_logits=True,
+            softmax_temperature=float(softmax_temperature),
+        )
+        # logits: (B, 1, num_classes)
+        pred = torch.argmax(logits[:, 0, :], dim=-1).detach().cpu().numpy()
+        preds.append(pred)
+
+    return np.concatenate(preds, axis=0)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate a trained adapter (mantis->adapter->icl_predictor) on UCR. "
-            "Adapter checkpoint is produced by src/tabicl/train/train_mantis_icl_adapter_only_from_ckpts.py."
+            "Evaluate a trained adapter (mantis->adapter->OrionMSP icl_predictor) on UCR. "
+            "Adapter checkpoint is produced by src/tabicl/train/train_mantis_orion_icl_adapter_only_from_ckpts.py."
         )
     )
 
@@ -272,10 +275,10 @@ def main() -> None:
         "--mode",
         type=str,
         default="direct",
-        choices=["direct", "classifier", "classifier_v2"],
+        choices=["direct", "classifier_v2"],
         help=(
-            "Evaluation mode: 'direct' uses _MantisAdapterPlusICL directly; "
-            "'classifier' uses MantisICLClassifier; 'classifier_v2' uses MantisICLClassifierV2."
+            "Evaluation mode: 'direct' uses cached support reps; "
+            "'classifier_v2' uses MantisICLClassifierV2 (class shift + RandomCropResize augmentation)."
         ),
     )
 
@@ -288,7 +291,7 @@ def main() -> None:
     parser.add_argument(
         "--adapter_ckpt_dir",
         type=str,
-        default="/data0/fangjuntao2025/tabicl-main/checkpoints/mantis_icl_adapter_only",
+        default="/data0/fangjuntao2025/tabicl-main/checkpoints/mantis_orion_icl_adapter_only",
         help="Directory to auto-pick the latest '*_epoch*.pt' if --adapter_ckpt is not provided.",
     )
 
@@ -299,10 +302,10 @@ def main() -> None:
         help="Mantis checkpoint (only used if not present in adapter ckpt).",
     )
     parser.add_argument(
-        "--tabicl_ckpt",
+        "--orion_ckpt",
         type=str,
-        default="/data0/fangjuntao2025/tabicl-main/tabICLOrignCheckpoint/tabicl-classifier-v1.1-0506.ckpt",
-        help="TabICL checkpoint (only used if not present in adapter ckpt).",
+        default=None,
+        help="OrionMSP checkpoint (only used if not present in adapter ckpt).",
     )
 
     parser.add_argument("--ucr_path", type=str, default="/data0/fangjuntao2025/CauKer/CauKerOrign/CauKer-main/UCRdata/")
@@ -317,7 +320,6 @@ def main() -> None:
     parser.add_argument("--dataset", type=str, default=None, help="Evaluate a single UCR dataset name")
 
     parser.add_argument("--n_estimators", type=int, default=1)
-    parser.add_argument("--feat_shuffle_method", type=str, default="latin")
 
     parser.add_argument(
         "--v2_class_shift",
@@ -347,13 +349,13 @@ def main() -> None:
         "--support_size",
         type=int,
         default=128,
-        help="(direct mode) Number of training samples used as ICL support (auto-bumped to >= #classes).",
+        help="Number of training samples used as ICL support (auto-bumped to >= #classes).",
     )
     parser.add_argument(
         "--query_batch_size",
         type=int,
         default=64,
-        help="(direct mode) Query batch size (number of test samples per forward).",
+        help="Query batch size (number of test samples per forward).",
     )
     parser.add_argument(
         "--softmax_temperature",
@@ -361,7 +363,7 @@ def main() -> None:
         default=0.9,
         help="Softmax temperature passed to icl_predictor inference.",
     )
-    parser.add_argument("--seed", type=int, default=0, help="Random seed for support sampling (direct mode).")
+    parser.add_argument("--seed", type=int, default=0, help="Random seed for support sampling.")
 
     parser.add_argument("--mantis_hidden_dim", type=int, default=512)
     parser.add_argument("--mantis_seq_len", type=int, default=512)
@@ -379,18 +381,23 @@ def main() -> None:
     train_args = adapter_ckpt.get("args") if isinstance(adapter_ckpt.get("args"), dict) else {}
 
     mantis_ckpt = str(adapter_ckpt.get("mantis_ckpt", args.mantis_ckpt))
-    tabicl_ckpt = str(adapter_ckpt.get("tabicl_ckpt", args.tabicl_ckpt))
+    orion_ckpt = adapter_ckpt.get("orion_ckpt", None)
+    if orion_ckpt is None:
+        orion_ckpt = args.orion_ckpt
+    if orion_ckpt is None:
+        raise ValueError("Missing Orion checkpoint. Provide --orion_ckpt or ensure adapter ckpt contains 'orion_ckpt'.")
+    orion_ckpt = str(orion_ckpt)
 
-    # Load TabICL and take icl_predictor only
-    tabicl_model, tabicl_cfg = _load_tabicl_checkpoint(tabicl_ckpt)
-    icl_predictor = tabicl_model.icl_predictor
+    # Load OrionMSP and take icl_predictor only
+    orion_model, orion_cfg = _load_orion_checkpoint(orion_ckpt)
+    icl_predictor = orion_model.icl_predictor
     for p in icl_predictor.parameters():
         p.requires_grad_(False)
     icl_predictor.to(device)
     icl_predictor.eval()
 
-    embed_dim = int(tabicl_cfg.get("embed_dim", 128))
-    row_num_cls = int(tabicl_cfg.get("row_num_cls", 2))
+    embed_dim = int(orion_cfg.get("embed_dim", getattr(orion_model, "embed_dim", 128)))
+    row_num_cls = int(orion_cfg.get("row_num_cls", 4))
     icl_dim = int(adapter_ckpt.get("icl_dim", embed_dim * row_num_cls))
 
     # Load mantis encoder
@@ -409,11 +416,7 @@ def main() -> None:
     adapter = TokenMLPAdapter(
         mantis_dim=int(mantis_dim),
         icl_dim=int(icl_dim),
-        hidden_dim=(
-            None
-            if train_args.get("adapter_hidden_dim") is None
-            else int(train_args.get("adapter_hidden_dim"))
-        ),
+        hidden_dim=(None if train_args.get("adapter_hidden_dim") is None else int(train_args.get("adapter_hidden_dim"))),
         dropout=float(train_args.get("adapter_dropout", 0.0)),
         use_layernorm=not bool(train_args.get("adapter_no_layernorm", False)),
     )
@@ -421,7 +424,7 @@ def main() -> None:
     adapter.to(device)
     adapter.eval()
 
-    custom_model = _MantisAdapterPlusICL(
+    custom_model = _MantisAdapterPlusOrionICL(
         mantis_model=mantis_model,
         adapter=adapter,
         icl_predictor=icl_predictor,
@@ -437,6 +440,7 @@ def main() -> None:
         UCR_data_path=str(args.ucr_path),
         transform_ts_size=int(args.mantis_seq_len),
     )
+
     if args.dataset is not None:
         dataset_names = [args.dataset]
     else:
@@ -444,7 +448,8 @@ def main() -> None:
 
     print(f"[Eval] adapter_ckpt: {adapter_ckpt_path}")
     print(f"[Eval] mantis_ckpt: {mantis_ckpt}")
-    print(f"[Eval] tabicl_ckpt: {tabicl_ckpt}")
+    print(f"[Eval] orion_ckpt: {orion_ckpt}")
+    print(f"[Eval] dataset_count: {len(dataset_names)}")
     print(f"[Eval] mode: {args.mode}")
 
     accs: list[float] = []
@@ -457,21 +462,7 @@ def main() -> None:
 
             y_tr_m, y_te_m, _classes = _remap_labels(y_tr, y_te)
 
-            if args.mode == "classifier":
-                clf = MantisICLClassifier(
-                    n_estimators=int(args.n_estimators),
-                    feat_shuffle_method=str(args.feat_shuffle_method),
-                    device=device,
-                    verbose=False,
-                    model_path=None,
-                    allow_auto_download=False,
-                    checkpoint_version="tabicl-classifier-v1.1-0506.ckpt",
-                )
-                clf.model_ = custom_model
-                clf.fit(X_tr_2d, y_tr_m)
-                y_pred = clf.predict(X_te_2d)
-                acc = float(np.mean(y_pred == y_te_m))
-            elif args.mode == "classifier_v2":
+            if args.mode == "classifier_v2":
                 crop_lo = float(args.v2_crop_rate_lo)
                 crop_hi = float(args.v2_crop_rate_hi)
                 if not (0.0 <= crop_lo <= crop_hi < 1.0):
@@ -486,6 +477,7 @@ def main() -> None:
                     n_augmentations=int(args.v2_n_augmentations),
                     softmax_temperature=float(args.softmax_temperature),
                     device=device,
+                    random_state=int(args.seed),
                     verbose=False,
                     model_path=None,
                     allow_auto_download=False,
@@ -507,7 +499,6 @@ def main() -> None:
                     X_query=X_te_2d,
                     query_batch_size=int(args.query_batch_size),
                     softmax_temperature=float(args.softmax_temperature),
-                    mgr_config=None,
                 )
                 acc = float(np.mean(y_pred == y_te_m))
 
