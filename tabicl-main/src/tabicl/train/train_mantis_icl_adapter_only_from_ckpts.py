@@ -4,7 +4,7 @@ This script follows the *dataset-as-task* meta-training style used in
 `train_adapter_with_classifierOrignv2.py`:
 - each UCR/UEA dataset is treated as one task
 - sample a fixed-size support set
-- build a query set from remaining train + all test samples
+- build a query set from the remaining train samples only (no test leakage)
 - map labels to contiguous IDs based on support classes
 - train only the adapter (Mantis + ICL are frozen)
 
@@ -235,7 +235,7 @@ def _prepare_meta_tasks(model: MantisAdapterICLOnly, batch_datasets, device: tor
     y_qry_mapped_list = []
     valid_mask_list = []
 
-    for X_train, y_train, X_test, y_test in batch_datasets:
+    for X_train, y_train in batch_datasets:
         task_device = y_train.device
         max_classes = int(getattr(model, "max_classes", 10))
 
@@ -267,15 +267,14 @@ def _prepare_meta_tasks(model: MantisAdapterICLOnly, batch_datasets, device: tor
 
         support_classes = torch.unique(y_sup)
         keep_mask_train_sup = torch.isin(y_train, support_classes)
-        keep_mask_test_sup = torch.isin(y_test, support_classes)
 
         support_mask = torch.ones(y_train.size(0), dtype=torch.bool, device=task_device)
         support_mask[support_idx] = False
         query_train_idx = torch.nonzero(support_mask & keep_mask_train_sup, as_tuple=False).flatten()
-        query_test_idx = torch.nonzero(keep_mask_test_sup, as_tuple=False).flatten()
 
-        X_qry = torch.cat([X_train[query_train_idx], X_test[query_test_idx]], dim=0)
-        y_qry = torch.cat([y_train[query_train_idx], y_test[query_test_idx]], dim=0)
+        # IMPORTANT: avoid data leakage. Query is built from the remaining TRAIN split only.
+        X_qry = X_train[query_train_idx]
+        y_qry = y_train[query_train_idx]
 
         if X_qry.size(0) < 1:
             continue
@@ -416,23 +415,19 @@ def train_step(model: MantisAdapterICLOnly, optimizer, criterion, batch_datasets
     return float(total_loss / float(denom))
 
 
-def _load_dataset_tensors(reader: DataReader, name: str, *, seq_len: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None:
+def _load_dataset_tensors(reader: DataReader, name: str, *, seq_len: int) -> tuple[torch.Tensor, torch.Tensor] | None:
     try:
         X_tr, y_tr = reader.read_dataset(name, which_set="train")
-        X_te, y_te = reader.read_dataset(name, which_set="test")
     except Exception:
         return None
 
     X_tr_2d = _ensure_2d_timeseries(X_tr)
-    X_te_2d = _ensure_2d_timeseries(X_te)
 
     X_tr_t = _resize_series_2d(X_tr_2d, target_len=int(seq_len))
-    X_te_t = _resize_series_2d(X_te_2d, target_len=int(seq_len))
 
     y_tr_t = torch.from_numpy(np.asarray(y_tr)).long()
-    y_te_t = torch.from_numpy(np.asarray(y_te)).long()
 
-    return X_tr_t, y_tr_t, X_te_t, y_te_t
+    return X_tr_t, y_tr_t
 
 
 def main() -> None:
@@ -571,8 +566,8 @@ def main() -> None:
                 loaded = _load_dataset_tensors(reader, name, seq_len=int(args.mantis_seq_len))
                 if loaded is None:
                     continue
-                X_tr, y_tr, X_te, y_te = loaded
-                batch.append((X_tr.to(device), y_tr.to(device), X_te.to(device), y_te.to(device)))
+                X_tr, y_tr = loaded
+                batch.append((X_tr.to(device), y_tr.to(device)))
 
             if len(batch) < 1:
                 continue

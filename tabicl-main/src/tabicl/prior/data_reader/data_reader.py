@@ -77,6 +77,10 @@ class DataReader:
 
         self.univariate = univariate
         self.channel_concat = channel_concat
+
+        # Per-dataset label encoders (fit on train split, reused for test/val).
+        # Keyed by base dataset name (e.g., "ECG200" for "ECG200:0").
+        self._label_encoders: dict[str, LabelEncoder] = {}
         self._get_dataset_lists()
 
     def _maybe_channel_concat(self, X: torch.Tensor) -> torch.Tensor:
@@ -151,6 +155,8 @@ class DataReader:
         else:
             channel_idx = None
 
+        base_dataset_name = dataset_name
+
         # UCR
         if dataset_name in self.dataset_list_ucr:
             if self.log_processing:
@@ -194,11 +200,41 @@ class DataReader:
         else:
             raise KeyError('Unknown dataset name.')
         
-        # encode labels to 0...K-1 if classification dataset
+        # Encode labels to 0...K-1 for classification datasets.
+        # Important: fit encoder on train split only, reuse for test/val to avoid
+        # inconsistent label-id mappings across splits.
         x, y = data
-        if dataset_name in self.classification_datasets:
-            lab_encoder = LabelEncoder()
-            y = lab_encoder.fit_transform(y)
+        if base_dataset_name in self.classification_datasets:
+            if which_set == 'train':
+                lab_encoder = LabelEncoder()
+                y = lab_encoder.fit_transform(y)
+                self._label_encoders[base_dataset_name] = lab_encoder
+            else:
+                lab_encoder = self._label_encoders.get(base_dataset_name)
+                if lab_encoder is None:
+                    # If test/val is loaded before train, proactively load the
+                    # train split once to fit an encoder, then reuse it.
+                    try:
+                        _ = self.read_dataset(base_dataset_name, which_set='train')
+                        lab_encoder = self._label_encoders.get(base_dataset_name)
+                    except Exception:
+                        lab_encoder = None
+
+                if lab_encoder is None:
+                    # Last-resort fallback (keeps prior behavior): fit on the
+                    # current split if we still don't have an encoder.
+                    lab_encoder = LabelEncoder()
+                    y = lab_encoder.fit_transform(y)
+                    self._label_encoders[base_dataset_name] = lab_encoder
+                else:
+                    try:
+                        y = lab_encoder.transform(y)
+                    except ValueError:
+                        # Unseen labels in this split (unexpected for UCR/UEA).
+                        # Fall back to per-split fitting to avoid hard failure.
+                        lab_encoder = LabelEncoder()
+                        y = lab_encoder.fit_transform(y)
+                        self._label_encoders[base_dataset_name] = lab_encoder
         
         return x, y
 

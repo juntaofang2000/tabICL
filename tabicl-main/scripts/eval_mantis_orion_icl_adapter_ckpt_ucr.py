@@ -19,6 +19,7 @@ from tabicl.model.mantis_adapter_icl import TokenMLPAdapter  # noqa: E402
 from tabicl.model.mantis_tabicl import build_mantis_encoder  # noqa: E402
 from tabicl.prior.data_reader import DataReader  # noqa: E402
 from tabicl.sklearn.classifier import MantisICLClassifierV2  # noqa: E402
+from tabicl.model.mantis_dev.adapters import VarianceBasedSelector  # noqa: E402
 
 from orion_msp.model.orion_msp import OrionMSP  # noqa: E402
 
@@ -79,8 +80,153 @@ def _ensure_2d_timeseries(X: np.ndarray) -> np.ndarray:
     if X.ndim == 3:
         if X.shape[1] == 1:
             return X[:, 0, :]
-        return X.mean(axis=1)
+        # NOTE: for UEA multivariate series, we do NOT average channels here.
+        # Use `_uea_concat_and_sample()` to concat channels and sample to a fixed length.
+        return X
     raise ValueError(f"Unexpected X shape: {X.shape}")
+
+
+def _uea_concat_and_sample(
+    X: np.ndarray,
+    *,
+    target_len: int,
+    seed: int,
+    mode: str = "center",
+) -> np.ndarray:
+    """Convert UEA (N,C,L) into (N,target_len) by channel-concat then crop/pad.
+
+    Spec required by user:
+    - For multichannel series, concatenate channels into a single long 1D series.
+    - Then sample a length `target_len` window (default 512) and feed to Mantis.
+    """
+
+    X = np.asarray(X, dtype=np.float32)
+    target_len = int(target_len)
+    if target_len <= 0:
+        raise ValueError(f"target_len must be > 0, got {target_len}")
+
+    if X.ndim == 2:
+        X_flat = X
+    elif X.ndim == 3:
+        N, C, L = X.shape
+        X_flat = X.reshape(N, C * L)
+    else:
+        raise ValueError(f"Unexpected UEA X shape: {X.shape}")
+
+    N, Ltot = X_flat.shape
+    if Ltot == target_len:
+        return X_flat
+
+    if Ltot < target_len:
+        pad = np.zeros((N, target_len - Ltot), dtype=np.float32)
+        return np.concatenate([X_flat, pad], axis=1)
+
+    # Ltot > target_len: crop
+    if mode not in {"center", "random"}:
+        raise ValueError(f"mode must be 'center' or 'random', got {mode}")
+    if mode == "center":
+        start = (Ltot - target_len) // 2
+        return X_flat[:, start : start + target_len]
+
+    rng = np.random.RandomState(int(seed))
+    # Deterministic but per-sample different windows
+    starts = rng.randint(0, Ltot - target_len + 1, size=N)
+    out = np.empty((N, target_len), dtype=np.float32)
+    for i, s in enumerate(starts.tolist()):
+        out[i] = X_flat[i, s : s + target_len]
+    return out
+
+
+def _ensure_3d_timeseries(X: np.ndarray) -> np.ndarray:
+    """Coerce X into (N, C, L)."""
+    X = np.asarray(X, dtype=np.float32)
+    if X.ndim == 1:
+        return X[None, None, :]
+    if X.ndim == 2:
+        return X[:, None, :]
+    if X.ndim == 3:
+        return X
+    raise ValueError(f"Unexpected X shape for 3d series: {X.shape}")
+
+
+def _uea_crop_pad_per_channel(
+    X: np.ndarray,
+    *,
+    target_len: int,
+    seed: int,
+    mode: str = "center",
+) -> np.ndarray:
+    """Crop/pad UEA to (N,C,target_len) without mixing channels.
+
+    Used by uea_fusion='sum_embed': each channel is fed into Mantis, then channel embeddings are summed.
+    """
+    X3 = _ensure_3d_timeseries(X)
+    target_len = int(target_len)
+    if target_len <= 0:
+        raise ValueError(f"target_len must be > 0, got {target_len}")
+
+    N, C, Ltot = X3.shape
+    if Ltot == target_len:
+        return X3
+    if Ltot < target_len:
+        pad = np.zeros((N, C, target_len - Ltot), dtype=np.float32)
+        return np.concatenate([X3, pad], axis=2)
+
+    if mode not in {"center", "random"}:
+        raise ValueError(f"mode must be 'center' or 'random', got {mode}")
+    if mode == "center":
+        start = (Ltot - target_len) // 2
+        return X3[:, :, start : start + target_len]
+
+    rng = np.random.RandomState(int(seed))
+    starts = rng.randint(0, Ltot - target_len + 1, size=N)
+    out = np.empty((N, C, target_len), dtype=np.float32)
+    for i, s in enumerate(starts.tolist()):
+        out[i] = X3[i, :, s : s + target_len]
+    return out
+
+
+def _maybe_select_channels_uea(
+    X_train_raw: np.ndarray,
+    X_test_raw: np.ndarray,
+    *,
+    enabled: bool,
+    new_num_channels: int | None,
+    dataset_name: str | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Apply VarianceBasedSelector on UEA multichannel time series.
+
+    Fits selector on training split only, then transforms train/test.
+    Expects input in (N, C, L) (or will be coerced by _ensure_3d_timeseries).
+    """
+    if not enabled:
+        return X_train_raw, X_test_raw
+    if new_num_channels is None:
+        return X_train_raw, X_test_raw
+
+    X_train_np = _ensure_3d_timeseries(X_train_raw)
+    X_test_np = _ensure_3d_timeseries(X_test_raw)
+
+    if X_train_np.ndim != 3:
+        return X_train_raw, X_test_raw
+
+    _, c_train, _ = X_train_np.shape
+    if c_train <= 1:
+        return X_train_np, X_test_np
+
+    k = int(new_num_channels)
+    k = max(1, min(k, c_train))
+    if k == c_train:
+        return X_train_np, X_test_np
+
+    if dataset_name is not None:
+        print(f"[VarSelector][UEA] {dataset_name}: channels {c_train} -> {k}")
+
+    selector = VarianceBasedSelector(k)
+    selector.fit(X_train_np)
+    X_train_sel = selector.transform(X_train_np)
+    X_test_sel = selector.transform(X_test_np)
+    return X_train_sel, X_test_sel
 
 
 def _find_latest_adapter_ckpt(dir_path: str) -> str:
@@ -150,6 +296,12 @@ class _MantisAdapterPlusOrionICL(nn.Module):
         return self
 
     def _pad_or_truncate(self, X: torch.Tensor) -> torch.Tensor:
+        """Pad/truncate last dimension to mantis_seq_len.
+
+        Supports:
+        - Univariate: (B, T, L)
+        - Multivariate: (B, T, C, L)
+        """
         target = self.mantis_seq_len
         if X.shape[-1] == target:
             return X
@@ -159,22 +311,38 @@ class _MantisAdapterPlusOrionICL(nn.Module):
         return torch.cat([X, pad], dim=-1)
 
     def _encode(self, X: torch.Tensor) -> torch.Tensor:
-        # X: (B, T, H)
-        B, T, _H = X.shape
+        """Encode rows with Mantis.
+
+        - If X is (B,T,L): encodes each row.
+        - If X is (B,T,C,L): encodes each channel separately then sums embeddings over C.
+        """
         X = self._pad_or_truncate(X)
-        H2 = X.shape[-1]
-        x_flat = X.reshape(B * T, 1, H2)
 
         device = next(self.mantis_model.parameters()).device
-        x_flat = x_flat.to(device)
-
-        reps = []
         bs = max(1, int(self.mantis_batch_size))
-        with torch.no_grad():
-            for i in range(0, x_flat.shape[0], bs):
-                reps.append(self.mantis_model(x_flat[i : i + bs]))
-        reps = torch.cat(reps, dim=0)
-        return reps.reshape(B, T, -1)
+
+        if X.dim() == 3:
+            B, T, L = X.shape
+            x_flat = X.reshape(B * T, 1, L).to(device)
+            reps = []
+            with torch.no_grad():
+                for i in range(0, x_flat.shape[0], bs):
+                    reps.append(self.mantis_model(x_flat[i : i + bs]))
+            reps = torch.cat(reps, dim=0)
+            return reps.reshape(B, T, -1)
+
+        if X.dim() == 4:
+            B, T, C, L = X.shape
+            x_flat = X.reshape(B * T * C, 1, L).to(device)
+            reps = []
+            with torch.no_grad():
+                for i in range(0, x_flat.shape[0], bs):
+                    reps.append(self.mantis_model(x_flat[i : i + bs]))
+            reps = torch.cat(reps, dim=0)  # (B*T*C, D)
+            reps = reps.reshape(B, T, C, -1).sum(dim=2)  # (B,T,D)
+            return reps
+
+        raise ValueError(f"Unexpected X dim for mantis encode: {X.dim()} with shape {tuple(X.shape)}")
 
     @torch.no_grad()
     def encode_and_adapt(self, X: torch.Tensor) -> torch.Tensor:
@@ -317,6 +485,14 @@ def main() -> None:
     )
     parser.add_argument("--device", type=str, default="cuda:0")
 
+    parser.add_argument(
+        "--suite",
+        type=str,
+        default="ucr",
+        choices=["ucr", "uea"],
+        help="Dataset suite to evaluate: UCR (univariate) or UEA (multivariate).",
+    )
+
     parser.add_argument("--dataset", type=str, default=None, help="Evaluate a single UCR dataset name")
 
     parser.add_argument("--n_estimators", type=int, default=1)
@@ -364,6 +540,37 @@ def main() -> None:
         help="Softmax temperature passed to icl_predictor inference.",
     )
     parser.add_argument("--seed", type=int, default=0, help="Random seed for support sampling.")
+
+    parser.add_argument(
+        "--uea_mode",
+        type=str,
+        default="center",
+        choices=["center", "random"],
+        help="(UEA) After channel-concat, how to sample length=mantis_seq_len window.",
+    )
+
+    parser.add_argument(
+        "--uea_use_var_selector",
+        action="store_true",
+        help="(UEA) Use VarianceBasedSelector to reduce channels before inference.",
+    )
+    parser.add_argument(
+        "--uea_var_num_channels",
+        type=int,
+        default=None,
+        help="(UEA) Target number of channels after VarianceBasedSelector.",
+    )
+    parser.add_argument(
+        "--uea_fusion",
+        type=str,
+        default="concat",
+        choices=["concat", "sum_embed"],
+        help=(
+            "(UEA) How to handle multichannel series: "
+            "'concat' concatenates channels in time then samples length=mantis_seq_len; "
+            "'sum_embed' encodes each channel with Mantis then sums channel embeddings."
+        ),
+    )
 
     parser.add_argument("--mantis_hidden_dim", type=int, default=512)
     parser.add_argument("--mantis_seq_len", type=int, default=512)
@@ -444,11 +651,15 @@ def main() -> None:
     if args.dataset is not None:
         dataset_names = [args.dataset]
     else:
-        dataset_names = list(reader.dataset_list_ucr)
+        if args.suite == "uea":
+            dataset_names = list(reader.dataset_list_uea)
+        else:
+            dataset_names = list(reader.dataset_list_ucr)
 
     print(f"[Eval] adapter_ckpt: {adapter_ckpt_path}")
     print(f"[Eval] mantis_ckpt: {mantis_ckpt}")
     print(f"[Eval] orion_ckpt: {orion_ckpt}")
+    print(f"[Eval] suite: {args.suite}")
     print(f"[Eval] dataset_count: {len(dataset_names)}")
     print(f"[Eval] mode: {args.mode}")
 
@@ -457,12 +668,63 @@ def main() -> None:
         try:
             X_tr, y_tr = reader.read_dataset(name, which_set="train")
             X_te, y_te = reader.read_dataset(name, which_set="test")
-            X_tr_2d = _ensure_2d_timeseries(X_tr)
-            X_te_2d = _ensure_2d_timeseries(X_te)
+
+            if args.suite == "uea":
+                X_tr, X_te = _maybe_select_channels_uea(
+                    X_tr,
+                    X_te,
+                    enabled=bool(args.uea_use_var_selector),
+                    new_num_channels=(None if args.uea_var_num_channels is None else int(args.uea_var_num_channels)),
+                    dataset_name=name,
+                )
+
+                if args.uea_fusion == "sum_embed":
+                    # Keep multichannel and crop/pad per channel to mantis_seq_len.
+                    X_tr_2d = _uea_crop_pad_per_channel(
+                        X_tr,
+                        target_len=int(args.mantis_seq_len),
+                        seed=int(args.seed),
+                        mode=str(args.uea_mode),
+                    )
+                    X_te_2d = _uea_crop_pad_per_channel(
+                        X_te,
+                        target_len=int(args.mantis_seq_len),
+                        seed=int(args.seed) + 1,
+                        mode=str(args.uea_mode),
+                    )
+                else:
+                    # Backward-compatible: concatenate channels then sample/crop.
+                    X_tr_2d = _uea_concat_and_sample(
+                        X_tr,
+                        target_len=int(args.mantis_seq_len),
+                        seed=int(args.seed),
+                        mode=str(args.uea_mode),
+                    )
+                    X_te_2d = _uea_concat_and_sample(
+                        X_te,
+                        target_len=int(args.mantis_seq_len),
+                        seed=int(args.seed) + 1,
+                        mode=str(args.uea_mode),
+                    )
+            else:
+                X_tr_2d = _ensure_2d_timeseries(X_tr)
+                X_te_2d = _ensure_2d_timeseries(X_te)
+
+                # UCR should already be (N,L); if UEA slips in here, fail loudly.
+                if X_tr_2d.ndim != 2 or X_te_2d.ndim != 2:
+                    raise ValueError(
+                        f"Expected univariate (N,L) arrays for UCR; got train {X_tr_2d.shape}, test {X_te_2d.shape}. "
+                        f"Did you mean --suite uea ?"
+                    )
 
             y_tr_m, y_te_m, _classes = _remap_labels(y_tr, y_te)
 
             if args.mode == "classifier_v2":
+                if args.suite == "uea" and args.uea_fusion == "sum_embed":
+                    raise ValueError(
+                        "classifier_v2 expects 2D inputs (n_samples, length). "
+                        "For UEA multichannel sum_embed, use --mode direct (or set --uea_fusion concat)."
+                    )
                 crop_lo = float(args.v2_crop_rate_lo)
                 crop_hi = float(args.v2_crop_rate_hi)
                 if not (0.0 <= crop_lo <= crop_hi < 1.0):
@@ -508,7 +770,7 @@ def main() -> None:
             print(f"{name}: failed: {e}")
 
     if accs:
-        print(f"\nEvaluated {len(accs)} UCR datasets | mean accuracy: {float(np.mean(accs)):.4f}")
+        print(f"\nEvaluated {len(accs)} {args.suite.upper()} datasets | mean accuracy: {float(np.mean(accs)):.4f}")
     else:
         print("No datasets evaluated successfully.")
 
